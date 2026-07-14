@@ -330,7 +330,7 @@ No backward seek or derived back-pointer is required; the derived format need on
 / Record alignment: For record-based data (BAM, BCF, FASTQ), align blocks to record boundaries so no record straddles a block. bzst's unbounded block size means even a single very large record (a long read, a wide multi-sample VCF row) can occupy its own block — something BGZF's 64 KiB limit made impossible.
 / Checksums: Enable Zstandard's content checksum on data frames.
 / Heterogeneous data: For data whose statistics drift along the file (e.g. concatenated FASTQs, name-sorted or multi-sample data), prefer larger blocks, which capture local context per block. A single static dictionary trained on the head of such a file degrades as the data diverges from its training sample (@issue-dict).
-/ Homogeneous data at small block sizes: This is the case a dictionary is for; see @issue-dict and the prototyping plan there.
+/ Small block sizes: If small blocks are required (e.g. for BAI/CSI compatibility), a dictionary was explored as a way to offset the resulting ratio cost, but did not prove worthwhile for v1 (@issue-dict).
 / Derived-format detection: Declare a `Format_Signature` in the header and, if needed, put a richer identification frame (under the format's own magic) early in the file.
 
 = Open issues <open-issues>
@@ -341,7 +341,7 @@ Tracked design questions. Resolved decisions and their rationale are in @resolve
 The block-header frame's `Compressed_Size` / `Uncompressed_Size` are `u64` in this draft. `u32` would halve the per-block header and matches `seekable_format`/`zeekstd` precedent while still allowing 4 GiB blocks; `u64` future-proofs and honours "the type is the only limit on block size." Whole-file *offsets* in the index stay `u64` regardless. *Lean:* `u64`. Open.
 
 == Dictionary profile <issue-dict>
-Whether to specify the dictionary profile (subtype `0x03`, embedded dictionary, `Dictionary_ID` wiring) in v1 or merely reserve it; and if specified, whether to allow a *single* embedded dictionary or *multiple* (one per `Dictionary_ID`, selected per block) to serve banded/drifting data. Key facts established: a `zstd` dictionary is fixed across blocks (each block also uses its own in-block history); cross-block "supplementing" is only possible via prefix chaining, which re-couples blocks and is therefore rejected; multiple dictionaries per file are possible because `Dictionary_ID` is per-frame. *Prototyping plan to motivate this:* compare compressing SAM at 64 KiB blocks, at 1 MiB blocks, and at 64 KiB blocks with a dictionary trained on a random sample of records — to measure how much of the large-block ratio a sampled dictionary recovers at small block sizes. Open.
+The dictionary subtype (`0x03`) is reserved but not specified in v1. Initial experiments applying dictionaries to both short-read and long-read data did not show gains sufficient to warrant a dictionary profile in v1. The idea is not ruled out — dictionaries may be revisited in a future version if they prove their worth.
 
 == Magic-number selection <issue-magic>
 Final values for the bzst structural-frame magic (provisional `0x184D2A5B`) and the `EOF_Magic` (provisional `0x8F92EA5B`), avoiding the `0x184D2A50` (`pzstd`) and `0x184D2A5E` (`seekable_format`) conventions. Open.
