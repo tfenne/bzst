@@ -9,6 +9,7 @@ use std::io::{self, Read, Write};
 
 use crate::codec::ZstdCompressor;
 use crate::index::Index;
+use crate::memory::{check_block_fits, default_alloc_limit};
 use crate::{
     xxh64, BzstError, BzstResult, FORMAT_VERSION, SIGNATURE, SKIPPABLE_MAGIC_MAX,
     SKIPPABLE_MAGIC_MIN, STRUCTURAL_MAGIC, SUBTYPE_BLOCK_HEADER, SUBTYPE_HEADER, SUBTYPE_INDEX,
@@ -54,8 +55,12 @@ impl<W: Write> FrameWriter<W> {
     }
 
     pub(crate) fn write_skippable(&mut self, magic: u32, payload: &[u8]) -> BzstResult<()> {
+        let size: u32 = payload
+            .len()
+            .try_into()
+            .map_err(|_| BzstError::Malformed("skippable frame payload exceeds the 4 GiB limit"))?;
         self.inner.write_all(&magic.to_le_bytes())?;
-        self.inner.write_all(&(payload.len() as u32).to_le_bytes())?;
+        self.inner.write_all(&size.to_le_bytes())?;
         self.inner.write_all(payload)?;
         self.pos += SKIPPABLE_HEADER_LEN as u64 + payload.len() as u64;
         Ok(())
@@ -86,11 +91,14 @@ pub(crate) struct FrameReader<R> {
     frame: Vec<u8>,
     data: Vec<u8>,
     pos: u64,
+    /// Ceiling on a single block's compressed + uncompressed bytes, guarding
+    /// against a corrupt size field driving an out-of-memory allocation.
+    max_block_bytes: u64,
 }
 
 impl<R: Read> FrameReader<R> {
-    pub(crate) fn new(inner: R) -> Self {
-        Self { inner, frame: Vec::new(), data: Vec::new(), pos: 0 }
+    pub(crate) fn new(inner: R, max_block_bytes: u64) -> Self {
+        Self { inner, frame: Vec::new(), data: Vec::new(), pos: 0, max_block_bytes }
     }
 
     /// Byte offset of the next frame to be read (== bytes consumed so far).
@@ -109,14 +117,14 @@ impl<R: Read> FrameReader<R> {
 
         if magic == STRUCTURAL_MAGIC {
             let mut size_buf = [0u8; 4];
-            self.inner.read_exact(&mut size_buf)?;
+            read_exact_or_trunc(&mut self.inner, &mut size_buf)?;
             let size = u32::from_le_bytes(size_buf) as usize;
             self.frame.clear();
             self.frame.extend_from_slice(&magic_buf);
             self.frame.extend_from_slice(&size_buf);
             let body = self.frame.len();
             self.frame.resize(body + size, 0);
-            self.inner.read_exact(&mut self.frame[body..])?;
+            read_exact_or_trunc(&mut self.inner, &mut self.frame[body..])?;
             self.pos += (SKIPPABLE_HEADER_LEN + size) as u64;
             if self.frame.len() < 9 {
                 return Err(BzstError::Truncated);
@@ -125,13 +133,22 @@ impl<R: Read> FrameReader<R> {
                 SUBTYPE_HEADER => Ok(Some(Frame::Header(Header::parse_frame(&self.frame)?))),
                 SUBTYPE_BLOCK_HEADER => {
                     let header = BlockHeader::parse_frame(&self.frame)?;
+                    check_block_fits(
+                        header.compressed_size,
+                        header.uncompressed_size,
+                        self.max_block_bytes,
+                    )?;
                     self.data.clear();
                     self.data.resize(header.compressed_size as usize, 0);
-                    self.inner.read_exact(&mut self.data)?;
+                    read_exact_or_trunc(&mut self.inner, &mut self.data)?;
                     self.pos += header.compressed_size;
                     Ok(Some(Frame::Block { header, data: &self.data }))
                 }
-                SUBTYPE_INDEX => Ok(Some(Frame::Index(Index::parse_frame(&self.frame)?))),
+                // Recognize the index frame WITHOUT validating its body: a corrupt
+                // trailing index must not break the forward read path, since the
+                // block-header frames are the source of truth. Callers that need
+                // the parsed index (`Frames`, `Index::read_from`) validate it.
+                SUBTYPE_INDEX => Ok(Some(Frame::Index(&self.frame))),
                 // Unknown structural subtype (a future version): surface it so
                 // callers can skip it; the `Read` path ignores non-Block frames.
                 _ => Ok(Some(Frame::Skippable(SkippableFrame {
@@ -141,16 +158,16 @@ impl<R: Read> FrameReader<R> {
             }
         } else if (SKIPPABLE_MAGIC_MIN..=SKIPPABLE_MAGIC_MAX).contains(&magic) {
             let mut size_buf = [0u8; 4];
-            self.inner.read_exact(&mut size_buf)?;
+            read_exact_or_trunc(&mut self.inner, &mut size_buf)?;
             let size = u32::from_le_bytes(size_buf) as usize;
             self.frame.clear();
             self.frame.resize(size, 0);
-            self.inner.read_exact(&mut self.frame)?;
+            read_exact_or_trunc(&mut self.inner, &mut self.frame)?;
             self.pos += (SKIPPABLE_HEADER_LEN + size) as u64;
             Ok(Some(Frame::Skippable(SkippableFrame { magic, payload: &self.frame })))
         } else if magic == ZSTD_FRAME_MAGIC {
             // A data frame must be preceded by a block-header frame in bzst.
-            Err(BzstError::Truncated)
+            Err(BzstError::Malformed("data frame not preceded by a block header"))
         } else {
             Err(BzstError::BadMagic { expected: STRUCTURAL_MAGIC, found: magic })
         }
@@ -182,7 +199,7 @@ impl EncodedBlock {
 
     /// On-disk length of the block (`[block-header frame][data frame]`).
     pub(crate) fn on_disk_len(&self) -> u64 {
-        BLOCK_HEADER_FRAME_LEN as u64 + self.data.len() as u64
+        block_on_disk_len(self.data.len() as u64)
     }
 }
 
@@ -204,7 +221,7 @@ impl Header {
 
     pub(crate) fn read_from<R: Read>(r: &mut R) -> BzstResult<Self> {
         let mut buf = [0u8; HEADER_FRAME_LEN];
-        r.read_exact(&mut buf)?;
+        read_exact_or_trunc(r, &mut buf)?;
         Self::parse_frame(&buf)
     }
 
@@ -360,21 +377,26 @@ pub(crate) struct SkippableFrame<'a> {
 #[derive(Debug)]
 pub(crate) enum Frame<'a> {
     Header(Header),
-    Block { header: BlockHeader, data: &'a [u8] },
+    Block {
+        header: BlockHeader,
+        data: &'a [u8],
+    },
     Skippable(SkippableFrame<'a>),
-    Index(Index),
+    /// The raw bytes of the trailing index frame, parsed on demand — a corrupt
+    /// index must not fail the forward read path.
+    Index(&'a [u8]),
 }
 
 impl Frame<'_> {
-    fn to_owned_frame(&self) -> OwnedFrame {
-        match self {
+    fn to_owned_frame(&self) -> BzstResult<OwnedFrame> {
+        Ok(match self {
             Frame::Header(h) => OwnedFrame::Header(h.clone()),
             Frame::Block { header, .. } => OwnedFrame::Block(*header),
             Frame::Skippable(s) => {
                 OwnedFrame::Skippable { magic: s.magic, payload: s.payload.to_vec() }
             }
-            Frame::Index(ix) => OwnedFrame::Index(ix.clone()),
-        }
+            Frame::Index(raw) => OwnedFrame::Index(Index::parse_frame(raw)?),
+        })
     }
 }
 
@@ -407,7 +429,7 @@ pub struct Frames<R> {
 impl<R: Read> Frames<R> {
     /// Walks the frames of `r` from the current position.
     pub fn new(r: R) -> Self {
-        Self { fr: FrameReader::new(r) }
+        Self { fr: FrameReader::new(r, default_alloc_limit()) }
     }
 }
 
@@ -417,7 +439,7 @@ impl<R: Read> Iterator for Frames<R> {
     fn next(&mut self) -> Option<Self::Item> {
         match self.fr.next_frame() {
             Ok(None) => None,
-            Ok(Some(frame)) => Some(Ok(frame.to_owned_frame())),
+            Ok(Some(frame)) => Some(frame.to_owned_frame()),
             Err(e) => Some(Err(e)),
         }
     }
@@ -437,4 +459,52 @@ fn read_full<R: Read>(r: &mut R, buf: &mut [u8]) -> io::Result<usize> {
         }
     }
     Ok(n)
+}
+
+/// Like `read_exact`, but reports a short read (mid-frame EOF) as
+/// [`BzstError::Truncated`] rather than a bare io error, so truncation is
+/// diagnosed consistently across the frame layer.
+fn read_exact_or_trunc<R: Read>(r: &mut R, buf: &mut [u8]) -> BzstResult<()> {
+    match r.read_exact(buf) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => Err(BzstError::Truncated),
+        Err(e) => Err(BzstError::Io(e)),
+    }
+}
+
+/// On-disk length of a block (`[block-header frame][data frame]`) given the data
+/// frame's compressed size. Shared by the writer and by [`Index::rebuild`].
+pub(crate) fn block_on_disk_len(compressed_size: u64) -> u64 {
+    BLOCK_HEADER_FRAME_LEN as u64 + compressed_size
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::BzstError;
+
+    #[test]
+    fn header_checksum_flip_is_detected() {
+        let mut bytes = Header::new([0; 4], Profiles::BASELINE).to_frame_bytes();
+        bytes[19] ^= 0xFF; // reserved byte, inside the checksummed region
+        assert!(matches!(
+            Header::parse_frame(&bytes),
+            Err(BzstError::ChecksumMismatch { frame: "header" })
+        ));
+    }
+
+    #[test]
+    fn block_header_checksum_flip_is_detected() {
+        let bh = BlockHeader {
+            compressed_size: 100,
+            uncompressed_size: 200,
+            flags: BlockFlags::default(),
+        };
+        let mut bytes = bh.to_frame_bytes();
+        bytes[10] ^= 0xFF; // inside compressed_size, within the checksummed region
+        assert!(matches!(
+            BlockHeader::parse_frame(&bytes),
+            Err(BzstError::ChecksumMismatch { frame: "block-header" })
+        ));
+    }
 }

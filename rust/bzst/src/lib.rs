@@ -15,7 +15,7 @@
 //!
 //! * High level: [`BzstWriter`] / [`BzstReader`] / [`SeekableReader`] — the
 //!   `std::io` ergonomic surface, plus block management and threading.
-//! * Value types: [`Header`], [`BlockHeader`], [`Index`], [`Frame`], … — the
+//! * Value types: [`Header`], [`BlockHeader`], [`Index`], [`OwnedFrame`], … — the
 //!   typed views of the wire format.
 //! * The zstd codec and raw frame I/O are internal (`pub(crate)`); the public
 //!   surface is the operations, not raw frame poking.
@@ -24,14 +24,17 @@ mod codec;
 mod concat;
 mod frame;
 mod index;
+mod memory;
 mod reader;
+mod threads;
 mod writer;
 
 pub use concat::concat;
 pub use frame::{BlockFlags, BlockHeader, Frames, Header, OwnedFrame, Profiles};
 pub use index::{Index, IndexEntry};
 pub use reader::{BzstReader, BzstReaderBuilder, SeekableReader};
-pub use writer::{BzstWriter, BzstWriterBuilder, Pool, Threads};
+pub use threads::{Pool, Threads};
+pub use writer::{BzstWriter, BzstWriterBuilder};
 
 use std::fmt;
 use std::io::{self, Read, Write};
@@ -53,8 +56,6 @@ pub const SUBTYPE_HEADER: u8 = 0x00;
 pub const SUBTYPE_BLOCK_HEADER: u8 = 0x01;
 /// Structural-frame subtype: the uncompressed→compressed index.
 pub const SUBTYPE_INDEX: u8 = 0x02;
-/// Structural-frame subtype: reserved for an embedded dictionary (unused in v1).
-pub const SUBTYPE_DICTIONARY: u8 = 0x03;
 
 /// Low bound of the zstd skippable-frame magic range.
 pub const SKIPPABLE_MAGIC_MIN: u32 = 0x184D_2A50;
@@ -85,8 +86,23 @@ pub enum BzstError {
     UnsupportedVersion(u8),
     /// A structural frame's checksum did not validate.
     ChecksumMismatch { frame: &'static str },
-    /// The stream ended in the middle of a frame, or lacks a valid EOF trailer.
+    /// The stream ended before a complete frame, or before the index frame — so
+    /// data is incomplete/lost. Distinct from [`BzstError::CorruptIndex`].
     Truncated,
+    /// The index frame is present but could not be validated or parsed; the data
+    /// blocks are intact and recoverable by a forward pass ([`Index::rebuild`]).
+    CorruptIndex,
+    /// The stream is structurally malformed: a frame was missing or out of order
+    /// (e.g. it did not start with a header frame).
+    Malformed(&'static str),
+    /// A block declares more memory than this host can safely allocate, so the
+    /// input is almost certainly corrupt.
+    BlockTooLarge {
+        /// Bytes the block would need to decode (compressed + uncompressed).
+        requested: u64,
+        /// The safe allocation ceiling for this host.
+        limit: u64,
+    },
     /// A caller-supplied skippable magic is out of range or collides with bzst's own.
     BadSkippableMagic(u32),
     /// The index does not fit in a single skippable frame (billions of blocks).
@@ -104,7 +120,16 @@ impl fmt::Display for BzstError {
             }
             BzstError::UnsupportedVersion(v) => write!(f, "unsupported bzst format version {v}"),
             BzstError::ChecksumMismatch { frame } => write!(f, "{frame} frame checksum mismatch"),
-            BzstError::Truncated => write!(f, "truncated or incomplete bzst stream"),
+            BzstError::Truncated => write!(f, "truncated or incomplete bzst stream (data lost)"),
+            BzstError::CorruptIndex => {
+                write!(f, "index frame is corrupt or unreadable; block data is intact")
+            }
+            BzstError::Malformed(what) => write!(f, "malformed bzst stream: {what}"),
+            BzstError::BlockTooLarge { requested, limit } => write!(
+                f,
+                "cannot decompress a block needing {requested} bytes: exceeds the safe limit of \
+                 {limit} bytes for this host; the input is likely corrupt"
+            ),
             BzstError::BadSkippableMagic(m) => {
                 write!(f, "skippable magic {m:#010x} is out of range or reserved by bzst")
             }

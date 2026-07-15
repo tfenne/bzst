@@ -13,6 +13,7 @@ use std::io::{Read, Write};
 
 use crate::frame::{EncodedBlock, Frame, FrameReader, FrameWriter, Header};
 use crate::index::IndexBuilder;
+use crate::memory::default_alloc_limit;
 use crate::{BzstError, BzstResult, Profiles};
 
 /// Concatenates `inputs` into a single bzst stream written to `out`, copying
@@ -39,7 +40,7 @@ pub fn concat<R: Read, W: Write>(inputs: impl IntoIterator<Item = R>, out: W) ->
     let mut header_written = false;
 
     for input in inputs {
-        let mut fr = FrameReader::new(input);
+        let mut fr = FrameReader::new(input, default_alloc_limit());
         match fr.next_frame()? {
             // The first input's header becomes the output header; later inputs'
             // headers are still validated (version, signature, checksum) on parse.
@@ -50,7 +51,7 @@ pub fn concat<R: Read, W: Write>(inputs: impl IntoIterator<Item = R>, out: W) ->
                 }
             }
             // Every bzst stream must open with a header frame.
-            _ => return Err(BzstError::Truncated),
+            _ => return Err(BzstError::Malformed("input does not start with a header frame")),
         }
         loop {
             match fr.next_frame()? {
@@ -67,7 +68,9 @@ pub fn concat<R: Read, W: Write>(inputs: impl IntoIterator<Item = R>, out: W) ->
                 // rebuilt from the blocks we copy.
                 Some(Frame::Index(_)) => {}
                 // A second header inside one stream is malformed.
-                Some(Frame::Header(_)) => return Err(BzstError::Truncated),
+                Some(Frame::Header(_)) => {
+                    return Err(BzstError::Malformed("unexpected second header frame"))
+                }
             }
         }
     }

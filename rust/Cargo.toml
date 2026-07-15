@@ -13,6 +13,7 @@ repository = "https://github.com/tfenne/bzst"
 zstd = "0.13"
 rayon = "1"
 xxhash-rust = { version = "0.8", features = ["xxh64"] }
+libc = "0.2"
 
 [profile.release]
 # Portable by default (no target-cpu=native); opt into tuning via RUSTFLAGS locally.

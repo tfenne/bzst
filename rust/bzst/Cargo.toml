@@ -11,3 +11,4 @@ description = "Block-compressed zstd: a parallel, seekable, zstd-compatible cont
 zstd.workspace = true
 rayon.workspace = true
 xxhash-rust.workspace = true
+libc.workspace = true

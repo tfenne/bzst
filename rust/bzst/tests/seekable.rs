@@ -107,6 +107,19 @@ fn block_for_offset_is_correct() {
 }
 
 #[test]
+fn seek_before_start_is_an_error() {
+    let data = pseudo_text(100_000, 9);
+    let bytes = write_file(&data, 32 << 10);
+    let mut sr = SeekableReader::new(std::io::Cursor::new(&bytes)).unwrap();
+
+    // std::io::Seek requires seeking before byte 0 to error, not clamp to 0.
+    assert!(sr.seek(SeekFrom::Current(-1)).is_err());
+    assert!(sr.seek(SeekFrom::End(-(data.len() as i64) - 1)).is_err());
+    // A valid seek still works.
+    assert_eq!(sr.seek(SeekFrom::Start(10)).unwrap(), 10);
+}
+
+#[test]
 fn uncompressed_block_size_partitions_the_stream() {
     let data = pseudo_text(1_000_000, 15);
     let bytes = write_file(&data, 64 << 10);

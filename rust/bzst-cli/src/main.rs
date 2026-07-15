@@ -152,6 +152,9 @@ fn main() -> Result<()> {
     if cli.lines_per_record != 1 && action != Action::Compress {
         bail!("--lines-per-record applies only when compressing");
     }
+    if cli.lines_per_record != 1 && cli.mode == Mode::Bin {
+        bail!("--lines-per-record has no effect with --mode bin (records need text mode)");
+    }
     match action {
         Action::Compress => transform(&cli, Op::Compress),
         Action::Decompress => transform(&cli, Op::Decompress),
@@ -191,6 +194,9 @@ fn transform_file(cli: &Cli, op: Op, path: &Path) -> Result<()> {
         Some(o) => o.clone(),
         None => derived_output(op, path)?,
     };
+    if same_file(path, &out) {
+        bail!("input and output are the same file: {}", path.display());
+    }
     if out.exists() && !cli.force {
         bail!("{} already exists; use -f to overwrite", out.display());
     }
@@ -302,10 +308,77 @@ fn decompress(cli: &Cli, reader: Box<dyn BufRead>, mut writer: Box<dyn Write>) -
     Ok(())
 }
 
-/// Text-mode splitting: emit a block at each line boundary once at least
+/// Text-mode splitting: cut a block at a line boundary once at least
 /// `block_size` bytes have accumulated, never splitting a `lines_per_record`
 /// group of lines across a block.
+///
+/// Single-line records (`lines_per_record == 1` — SAM/VCF/BED, and the default)
+/// take a bulk path that scans for a newline only when a block is large enough
+/// to cut, avoiding a per-line copy into an intermediate buffer. Multi-line
+/// records (e.g. 4-line FASTQ) keep the straightforward per-record grouping,
+/// which must track record boundaries line by line anyway.
 fn write_text<W: Write>(
+    r: &mut dyn BufRead,
+    w: &mut BzstWriter<W>,
+    block_size: usize,
+    lines_per_record: usize,
+) -> Result<()> {
+    if lines_per_record == 1 {
+        write_lines(r, w, block_size)
+    } else {
+        write_records(r, w, block_size, lines_per_record)
+    }
+}
+
+/// Single-line-record text splitting (the common case). Stages input in bulk and
+/// cuts a block at the first newline at or after the point where the staged
+/// bytes reach `block_size`, so blocks stay line-aligned without copying each
+/// line through an intermediate buffer.
+fn write_lines<W: Write>(
+    r: &mut dyn BufRead,
+    w: &mut BzstWriter<W>,
+    block_size: usize,
+) -> Result<()> {
+    let mut since = 0usize; // bytes staged toward the current (uncut) block
+    loop {
+        let chunk = r.fill_buf()?;
+        if chunk.is_empty() {
+            break; // EOF; finish() emits any trailing partial line as the last block
+        }
+        let n = chunk.len();
+        if since + n < block_size {
+            // Still short of the target: stage the whole chunk and read on.
+            w.write_all(chunk)?;
+            since += n;
+            r.consume(n);
+            continue;
+        }
+        // The block reaches its target within this chunk. Cut at the first newline
+        // at or after the crossing point so the block ends on a line boundary.
+        let cross = block_size.saturating_sub(since);
+        match chunk[cross..].iter().position(|&b| b == b'\n') {
+            Some(rel) => {
+                let cut = cross + rel + 1; // include the newline in this block
+                w.write_all(&chunk[..cut])?;
+                w.end_block()?;
+                since = 0;
+                r.consume(cut);
+            }
+            None => {
+                // No newline past the crossing point; stage the whole chunk and cut
+                // in a later one (this block runs a little past its target).
+                w.write_all(chunk)?;
+                since += n;
+                r.consume(n);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Multi-line-record text splitting: reads `lines_per_record` lines at a time and
+/// never splits a record across a block, cutting once a block reaches `block_size`.
+fn write_records<W: Write>(
     r: &mut dyn BufRead,
     w: &mut BzstWriter<W>,
     block_size: usize,
@@ -452,6 +525,11 @@ fn cat(cli: &Cli) -> Result<()> {
     if cli.files.is_empty() {
         bail!("--cat requires input files");
     }
+    if let Some(o) = &cli.output {
+        if cli.files.iter().any(|input| same_file(input, o)) {
+            bail!("output {} is also an input file", o.display());
+        }
+    }
     let mut readers = Vec::with_capacity(cli.files.len());
     for path in &cli.files {
         readers.push(BufReader::new(
@@ -478,6 +556,15 @@ fn threads_of(n: usize) -> Threads {
         Threads::Serial
     } else {
         Threads::Owned(n)
+    }
+}
+
+/// True if `a` and `b` resolve to the same existing file, so an operation would
+/// clobber its own input. Paths that don't both exist can't be the same file.
+fn same_file(a: &Path, b: &Path) -> bool {
+    match (fs::canonicalize(a), fs::canonicalize(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
     }
 }
 

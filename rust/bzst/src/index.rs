@@ -6,7 +6,8 @@
 
 use std::io::{Read, Seek, SeekFrom};
 
-use crate::frame::{Frame, FrameReader, BLOCK_HEADER_FRAME_LEN};
+use crate::frame::{block_on_disk_len, Frame, FrameReader};
+use crate::memory::default_alloc_limit;
 use crate::{xxh64, BzstError, BzstResult, EOF_MAGIC, STRUCTURAL_MAGIC, SUBTYPE_INDEX};
 
 /// Bytes per on-disk index entry (three `u64`s).
@@ -36,7 +37,10 @@ pub struct Index {
 }
 
 impl Index {
-    /// Loads the index of a seekable stream via its EOF trailer.
+    /// Loads the index of a seekable stream via its EOF trailer. A missing EOF
+    /// sentinel is [`BzstError::Truncated`] (data lost); a present-but-unreadable
+    /// index is [`BzstError::CorruptIndex`] (block data still recoverable via
+    /// [`Index::rebuild`]).
     pub fn read_from<R: Read + Seek>(r: &mut R) -> BzstResult<Self> {
         let end = r.seek(SeekFrom::End(0))?;
         if end < EOF_TRAILER_LEN as u64 {
@@ -48,19 +52,28 @@ impl Index {
         let index_offset = u64::from_le_bytes(trailer[0..8].try_into().unwrap());
         let eof = u32::from_le_bytes(trailer[8..12].try_into().unwrap());
         if eof != EOF_MAGIC {
-            return Err(BzstError::BadMagic { expected: EOF_MAGIC, found: eof });
+            // No EOF sentinel: the file is truncated or not a bzst stream at all.
+            return Err(BzstError::Truncated);
+        }
+        // The sentinel says the file is complete, so from here a bad index is a
+        // corrupt (recoverable) index, not lost data. Bound every read against the
+        // file length so a bogus index_offset/size can't over-read or over-allocate.
+        if index_offset > end || end - index_offset < 8 {
+            return Err(BzstError::CorruptIndex);
         }
         r.seek(SeekFrom::Start(index_offset))?;
         let mut head = [0u8; 8];
         r.read_exact(&mut head)?;
-        let magic = u32::from_le_bytes(head[0..4].try_into().unwrap());
-        if magic != STRUCTURAL_MAGIC {
-            return Err(BzstError::BadMagic { expected: STRUCTURAL_MAGIC, found: magic });
+        if u32::from_le_bytes(head[0..4].try_into().unwrap()) != STRUCTURAL_MAGIC {
+            return Err(BzstError::CorruptIndex);
         }
         let size = u32::from_le_bytes(head[4..8].try_into().unwrap()) as usize;
-        let mut frame = Vec::with_capacity(8 + size);
-        frame.extend_from_slice(&head);
-        frame.resize(8 + size, 0);
+        // The index is the last frame, so it must span exactly to EOF.
+        if 8 + size as u64 != end - index_offset {
+            return Err(BzstError::CorruptIndex);
+        }
+        let mut frame = vec![0u8; 8 + size];
+        frame[..8].copy_from_slice(&head);
         r.read_exact(&mut frame[8..])?;
         Self::parse_frame(&frame)
     }
@@ -68,15 +81,18 @@ impl Index {
     /// Reconstructs the index by a forward pass over the block-header frames
     /// (for an index-less or damaged file).
     pub fn rebuild<R: Read>(r: R) -> BzstResult<Self> {
-        let mut fr = FrameReader::new(r);
+        let mut fr = FrameReader::new(r, default_alloc_limit());
         let mut builder = IndexBuilder::new();
         loop {
             let start = fr.position();
             match fr.next_frame()? {
                 None => break,
                 Some(Frame::Block { header, .. }) => {
-                    let block_length = BLOCK_HEADER_FRAME_LEN as u64 + header.compressed_size;
-                    builder.push(start, block_length, header.uncompressed_size);
+                    builder.push(
+                        start,
+                        block_on_disk_len(header.compressed_size),
+                        header.uncompressed_size,
+                    );
                 }
                 Some(_) => {}
             }
@@ -128,7 +144,7 @@ impl Index {
             Some(next) => next.uncompressed_offset,
             None => self.total_uncompressed,
         };
-        Some(end - start)
+        Some(end.saturating_sub(start))
     }
 
     pub(crate) fn parse_frame(f: &[u8]) -> BzstResult<Self> {
@@ -141,27 +157,30 @@ impl Index {
             return Err(BzstError::BadMagic { expected: STRUCTURAL_MAGIC, found: magic });
         }
         if f[8] != SUBTYPE_INDEX {
-            return Err(BzstError::Truncated);
+            return Err(BzstError::CorruptIndex);
         }
         let index_flags = f[9];
         let entry_count = u64::from_le_bytes(f[10..18].try_into().unwrap()) as usize;
         let total = u64::from_le_bytes(f[18..26].try_into().unwrap());
         let entries_len = entry_count.checked_mul(ENTRY_LEN).ok_or(BzstError::IndexTooLarge)?;
         let entries_end = HEAD.checked_add(entries_len).ok_or(BzstError::IndexTooLarge)?;
-        if f.len() < entries_end + FIXED_TAIL {
-            return Err(BzstError::Truncated);
+        let frame_min = entries_end.checked_add(FIXED_TAIL).ok_or(BzstError::IndexTooLarge)?;
+        if f.len() < frame_min {
+            return Err(BzstError::CorruptIndex);
         }
         let eof = u32::from_le_bytes(f[f.len() - 4..].try_into().unwrap());
         if eof != EOF_MAGIC {
-            return Err(BzstError::BadMagic { expected: EOF_MAGIC, found: eof });
+            return Err(BzstError::CorruptIndex);
         }
         let stored = u64::from_le_bytes(f[entries_end..entries_end + 8].try_into().unwrap());
         if xxh64(&f[9..entries_end]) != stored {
-            return Err(BzstError::ChecksumMismatch { frame: "index" });
+            return Err(BzstError::CorruptIndex);
         }
         if index_flags != 0 {
-            // Compressed-index entries are reserved for a later version.
-            return Err(BzstError::Truncated);
+            // A compressed index (Index_Flags bit 0) is a later-version feature we
+            // can't decode; treat it as an unrecoverable index so seekable readers
+            // fall back to rebuilding from the block-header frames.
+            return Err(BzstError::CorruptIndex);
         }
         let mut entries = Vec::with_capacity(entry_count);
         for i in 0..entry_count {
@@ -171,6 +190,14 @@ impl Index {
                 block_offset: u64::from_le_bytes(f[b + 8..b + 16].try_into().unwrap()),
                 block_length: u64::from_le_bytes(f[b + 16..b + 24].try_into().unwrap()),
             });
+        }
+        // Entries must be monotonic in uncompressed offset and bounded by the
+        // total, or the offset arithmetic (block_for_offset, uncompressed_block_size)
+        // would misbehave on a crafted index.
+        let monotonic =
+            entries.windows(2).all(|w| w[0].uncompressed_offset <= w[1].uncompressed_offset);
+        if !monotonic || entries.last().is_some_and(|e| e.uncompressed_offset > total) {
+            return Err(BzstError::CorruptIndex);
         }
         Ok(Self { entries, total_uncompressed: total })
     }
@@ -227,5 +254,39 @@ impl IndexBuilder {
 
     pub(crate) fn finish(self) -> Index {
         Index { entries: self.entries, total_uncompressed: self.uncompressed }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Index, IndexEntry};
+    use crate::{BzstError, EOF_MAGIC, STRUCTURAL_MAGIC, SUBTYPE_INDEX};
+
+    #[test]
+    fn crafted_entry_count_overflow_errors_not_panics() {
+        // A minimal index frame whose entry_count would overflow the length
+        // arithmetic; parsing must return IndexTooLarge, not panic.
+        let mut f = vec![0u8; 46]; // HEAD(26) + FIXED_TAIL(20)
+        f[0..4].copy_from_slice(&STRUCTURAL_MAGIC.to_le_bytes());
+        f[4..8].copy_from_slice(&38u32.to_le_bytes());
+        f[8] = SUBTYPE_INDEX;
+        f[10..18].copy_from_slice(&(u64::MAX / 8).to_le_bytes()); // poisoned entry_count
+        f[42..46].copy_from_slice(&EOF_MAGIC.to_le_bytes());
+        assert!(matches!(Index::parse_frame(&f), Err(BzstError::IndexTooLarge)));
+    }
+
+    #[test]
+    fn non_monotonic_index_is_rejected() {
+        // A checksum-valid frame whose entries go backwards must be rejected so
+        // the offset arithmetic can't underflow.
+        let index = Index {
+            entries: vec![
+                IndexEntry { uncompressed_offset: 100, block_offset: 28, block_length: 50 },
+                IndexEntry { uncompressed_offset: 50, block_offset: 78, block_length: 50 },
+            ],
+            total_uncompressed: 200,
+        };
+        let frame = index.to_frame_bytes(0).unwrap();
+        assert!(matches!(Index::parse_frame(&frame), Err(BzstError::CorruptIndex)));
     }
 }
