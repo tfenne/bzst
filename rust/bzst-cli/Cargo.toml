@@ -1,0 +1,17 @@
+[package]
+name = "bzst-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Command-line tool for the bzst block-compressed zstd format."
+
+[[bin]]
+name = "bzst"
+path = "src/main.rs"
+
+[dependencies]
+bzst = { path = "../bzst" }
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"

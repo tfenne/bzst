@@ -1,0 +1,19 @@
+[workspace]
+resolver = "2"
+members = ["bzst", "bzst-cli"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.96"
+license = "MIT"
+repository = "https://github.com/tfenne/bzst"
+
+[workspace.dependencies]
+zstd = "0.13"
+rayon = "1"
+xxhash-rust = { version = "0.8", features = ["xxh64"] }
+
+[profile.release]
+# Portable by default (no target-cpu=native); opt into tuning via RUSTFLAGS locally.
+lto = "thin"

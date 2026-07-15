@@ -1,0 +1,13 @@
+[package]
+name = "bzst"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Block-compressed zstd: a parallel, seekable, zstd-compatible container format."
+
+[dependencies]
+zstd.workspace = true
+rayon.workspace = true
+xxhash-rust.workspace = true
