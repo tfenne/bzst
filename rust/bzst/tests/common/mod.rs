@@ -31,7 +31,12 @@ pub fn pseudo_text(n: usize, seed: u64) -> Vec<u8> {
     out
 }
 
-/// A unique temp path for a test artifact (cleaned up by the caller).
+/// A unique temp path for a test artifact (cleaned up by the caller). Tests run
+/// concurrently within one process, so a per-process atomic counter keeps paths
+/// distinct even if two callers pass the same `name`.
 pub fn tmp_path(name: &str) -> std::path::PathBuf {
-    std::env::temp_dir().join(format!("bzst_test_{}_{}", std::process::id(), name))
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
+    std::env::temp_dir().join(format!("bzst_test_{}_{}_{}", std::process::id(), unique, name))
 }

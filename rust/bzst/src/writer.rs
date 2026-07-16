@@ -143,9 +143,17 @@ impl<W: Write> BzstWriter<W> {
 impl<W: Write> Write for BzstWriter<W> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         self.staging.extend_from_slice(buf);
-        while self.staging.len() >= self.block_size {
-            let block: Vec<u8> = self.staging.drain(..self.block_size).collect();
+        // Slice out whole blocks via a cursor and drain the consumed prefix once,
+        // rather than draining from the front per block: front-draining shifts the
+        // remaining tail every time, which is quadratic for a single large write.
+        let mut consumed = 0;
+        while self.staging.len() - consumed >= self.block_size {
+            let block = self.staging[consumed..consumed + self.block_size].to_vec();
+            consumed += self.block_size;
             self.emit_block(block)?;
+        }
+        if consumed > 0 {
+            self.staging.drain(..consumed);
         }
         Ok(buf.len())
     }

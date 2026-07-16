@@ -343,6 +343,22 @@ fn output_equals_input_is_rejected() {
 }
 
 #[test]
+#[cfg(unix)]
+fn hard_link_of_input_is_rejected_as_output() {
+    // A hard link to the input refers to the *same file*; writing to it via -o
+    // would truncate the input. same_file must catch this by device+inode, since
+    // the two names canonicalize to different paths.
+    let dir = scratch("hardlink");
+    let data = text(1000);
+    fs::write(dir.join("a.txt"), &data).unwrap();
+    fs::hard_link(dir.join("a.txt"), dir.join("b.txt")).unwrap();
+
+    let out = run(&dir, &["-f", "-o", "b.txt", "a.txt"]);
+    assert!(!out.status.success(), "a hard link of the input must be rejected as output");
+    assert_eq!(fs::read(dir.join("a.txt")).unwrap(), data, "the input must be untouched");
+}
+
+#[test]
 fn bin_mode_with_lines_per_record_is_rejected() {
     let dir = scratch("bin_lines");
     fs::write(dir.join("a.txt"), text(1000)).unwrap();

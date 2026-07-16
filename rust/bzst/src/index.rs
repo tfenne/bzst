@@ -72,7 +72,9 @@ impl Index {
         if 8 + size as u64 != end - index_offset {
             return Err(BzstError::CorruptIndex);
         }
-        let mut frame = vec![0u8; 8 + size];
+        let mut frame = Vec::new();
+        frame.try_reserve_exact(8 + size).map_err(|_| BzstError::CorruptIndex)?;
+        frame.resize(8 + size, 0);
         frame[..8].copy_from_slice(&head);
         r.read_exact(&mut frame[8..])?;
         Self::parse_frame(&frame)
@@ -182,7 +184,8 @@ impl Index {
             // fall back to rebuilding from the block-header frames.
             return Err(BzstError::CorruptIndex);
         }
-        let mut entries = Vec::with_capacity(entry_count);
+        let mut entries = Vec::new();
+        entries.try_reserve(entry_count).map_err(|_| BzstError::IndexTooLarge)?;
         for i in 0..entry_count {
             let b = HEAD + i * ENTRY_LEN;
             entries.push(IndexEntry {
@@ -191,12 +194,22 @@ impl Index {
                 block_length: u64::from_le_bytes(f[b + 16..b + 24].try_into().unwrap()),
             });
         }
-        // Entries must be monotonic in uncompressed offset and bounded by the
-        // total, or the offset arithmetic (block_for_offset, uncompressed_block_size)
-        // would misbehave on a crafted index.
-        let monotonic =
-            entries.windows(2).all(|w| w[0].uncompressed_offset <= w[1].uncompressed_offset);
-        if !monotonic || entries.last().is_some_and(|e| e.uncompressed_offset > total) {
+        // The index must be able to map the whole uncompressed range, or the offset
+        // arithmetic (block_for_offset, uncompressed_block_size) would misbehave or
+        // silently drop data on a crafted index: an empty index must have zero
+        // total; otherwise the first block starts at offset 0, offsets increase
+        // strictly, and the last block starts before the end.
+        let valid_shape = match entries.as_slice() {
+            [] => total == 0,
+            [first, ..] => {
+                first.uncompressed_offset == 0
+                    && entries
+                        .windows(2)
+                        .all(|w| w[0].uncompressed_offset < w[1].uncompressed_offset)
+                    && entries.last().is_some_and(|e| e.uncompressed_offset < total)
+            }
+        };
+        if !valid_shape {
             return Err(BzstError::CorruptIndex);
         }
         Ok(Self { entries, total_uncompressed: total })

@@ -200,13 +200,17 @@ fn transform_file(cli: &Cli, op: Op, path: &Path) -> Result<()> {
     if out.exists() && !cli.force {
         bail!("{} already exists; use -f to overwrite", out.display());
     }
+    // Write to a temporary sibling and rename onto `out` only after the operation
+    // succeeds, so a failure never destroys an existing output or leaves a partial.
+    let tmp = temp_sibling(&out);
     let writer: Box<dyn Write> = Box::new(BufWriter::new(
-        File::create(&out).with_context(|| format!("creating {}", out.display()))?,
+        File::create(&tmp).with_context(|| format!("creating {}", tmp.display()))?,
     ));
     if let Err(e) = transform_stream(cli, op, reader, writer) {
-        let _ = fs::remove_file(&out); // don't leave a partial/corrupt output behind
+        let _ = fs::remove_file(&tmp); // don't leave a partial/corrupt output behind
         return Err(e);
     }
+    fs::rename(&tmp, &out).with_context(|| format!("finalizing {}", out.display()))?;
     // gzip-style: remove the input only in the default in-place case.
     if !cli.keep && cli.output.is_none() {
         fs::remove_file(path).with_context(|| format!("removing {}", path.display()))?;
@@ -434,9 +438,21 @@ fn derived_output(op: Op, input: &Path) -> Result<PathBuf> {
 /// Tests the integrity of each input (or stdin), reporting per-file OK/FAILED.
 fn test(cli: &Cli) -> Result<()> {
     if cli.files.is_empty() {
-        let reader: Box<dyn BufRead> = Box::new(BufReader::new(io::stdin().lock()));
-        let mut r = BzstReader::new(reader).context("testing stdin")?;
-        io::copy(&mut r, &mut io::sink()).context("testing stdin")?;
+        // The full integrity check cross-validates the index against a rebuild,
+        // which needs a seekable input; stdin isn't one, so spool it to a temp file
+        // (bounded by disk, not memory) and test that. Testing a file avoids the copy.
+        let tmp =
+            std::env::temp_dir().join(format!("bzst-test-stdin.{}{SUFFIX}", std::process::id()));
+        let result = (|| -> Result<()> {
+            let mut f =
+                File::create(&tmp).with_context(|| format!("creating {}", tmp.display()))?;
+            io::copy(&mut io::stdin().lock(), &mut f).context("reading stdin")?;
+            f.flush()?;
+            drop(f);
+            test_file(cli, &tmp)
+        })();
+        let _ = fs::remove_file(&tmp);
+        result.context("testing stdin")?;
         println!("stdin: OK");
         return Ok(());
     }
@@ -536,18 +552,28 @@ fn cat(cli: &Cli) -> Result<()> {
             File::open(path).with_context(|| format!("opening {}", path.display()))?,
         ));
     }
-    let writer: Box<dyn Write> = match &cli.output {
+    match &cli.output {
         Some(o) => {
             if o.exists() && !cli.force {
                 bail!("{} already exists; use -f to overwrite", o.display());
             }
-            Box::new(BufWriter::new(
-                File::create(o).with_context(|| format!("creating {}", o.display()))?,
-            ))
+            // Same temp-then-rename discipline as single-file output.
+            let tmp = temp_sibling(o);
+            let writer: Box<dyn Write> = Box::new(BufWriter::new(
+                File::create(&tmp).with_context(|| format!("creating {}", tmp.display()))?,
+            ));
+            let result = bzst::concat(readers, writer);
+            if result.is_err() {
+                let _ = fs::remove_file(&tmp);
+            }
+            result.context("concatenating")?;
+            fs::rename(&tmp, o).with_context(|| format!("finalizing {}", o.display()))?;
         }
-        None => Box::new(BufWriter::new(io::stdout().lock())),
-    };
-    bzst::concat(readers, writer).context("concatenating")?;
+        None => {
+            let writer: Box<dyn Write> = Box::new(BufWriter::new(io::stdout().lock()));
+            bzst::concat(readers, writer).context("concatenating")?;
+        }
+    }
     Ok(())
 }
 
@@ -560,12 +586,35 @@ fn threads_of(n: usize) -> Threads {
 }
 
 /// True if `a` and `b` resolve to the same existing file, so an operation would
-/// clobber its own input. Paths that don't both exist can't be the same file.
+/// clobber its own input. On Unix this compares device + inode, so distinct hard
+/// links to one file are recognized as the same; elsewhere it compares canonical
+/// paths. Paths that don't both resolve can't be the same file.
+#[cfg(unix)]
+fn same_file(a: &Path, b: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    match (fs::metadata(a), fs::metadata(b)) {
+        (Ok(a), Ok(b)) => a.dev() == b.dev() && a.ino() == b.ino(),
+        _ => false,
+    }
+}
+
+/// True if `a` and `b` resolve to the same existing file. Non-Unix fallback that
+/// compares canonical paths, so it does not detect hard links.
+#[cfg(not(unix))]
 fn same_file(a: &Path, b: &Path) -> bool {
     match (fs::canonicalize(a), fs::canonicalize(b)) {
         (Ok(a), Ok(b)) => a == b,
         _ => false,
     }
+}
+
+/// A temporary sibling path next to `out` (same directory, so the final rename is
+/// atomic on one filesystem). Output is written here and renamed onto `out` only
+/// once complete, so a failure never destroys an existing file or leaves a partial.
+fn temp_sibling(out: &Path) -> PathBuf {
+    let mut name = out.as_os_str().to_owned();
+    name.push(format!(".tmp{}", std::process::id()));
+    PathBuf::from(name)
 }
 
 #[cfg(test)]

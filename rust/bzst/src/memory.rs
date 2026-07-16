@@ -19,18 +19,23 @@ pub(crate) fn check_block_fits(compressed: u64, uncompressed: u64, limit: u64) -
     }
 }
 
+/// Fallback per-block allocation cap used when total physical memory can't be
+/// queried (e.g. an unsupported platform). Generous enough for any realistic
+/// block yet bounded, so protection is never fully disabled.
+const FALLBACK_ALLOC_LIMIT: u64 = 8 << 30; // 8 GiB
+
 /// A conservative cap on the bytes one block may require to decode (compressed +
 /// uncompressed): 95% of total physical memory, queried once and cached. A block
 /// that needs more than the host has cannot be decoded anyway, so rejecting it is
-/// the correct outcome. Falls back to `u64::MAX` (no cap) when the platform total
-/// can't be determined — the reader's incremental compressed reads still bound
-/// the compressed side in that case.
+/// the correct outcome. When the platform total can't be determined, falls back
+/// to [`FALLBACK_ALLOC_LIMIT`] rather than disabling the cap, so a corrupt size
+/// field still can't drive an unbounded allocation.
 pub(crate) fn default_alloc_limit() -> u64 {
     static LIMIT: OnceLock<u64> = OnceLock::new();
     *LIMIT.get_or_init(|| match total_physical_memory() {
         // Divide before multiplying to keep well clear of u64 overflow.
         Some(total) => (total / 100) * 95,
-        None => u64::MAX,
+        None => FALLBACK_ALLOC_LIMIT,
     })
 }
 

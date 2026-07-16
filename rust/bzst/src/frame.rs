@@ -119,6 +119,9 @@ impl<R: Read> FrameReader<R> {
             let mut size_buf = [0u8; 4];
             read_exact_or_trunc(&mut self.inner, &mut size_buf)?;
             let size = u32::from_le_bytes(size_buf) as usize;
+            // Bound the frame-envelope allocation the same way as block data: a
+            // corrupt 32-bit size field must not drive a multi-GiB allocation.
+            check_block_fits(size as u64, 0, self.max_block_bytes)?;
             self.frame.clear();
             self.frame.extend_from_slice(&magic_buf);
             self.frame.extend_from_slice(&size_buf);
@@ -160,6 +163,7 @@ impl<R: Read> FrameReader<R> {
             let mut size_buf = [0u8; 4];
             read_exact_or_trunc(&mut self.inner, &mut size_buf)?;
             let size = u32::from_le_bytes(size_buf) as usize;
+            check_block_fits(size as u64, 0, self.max_block_bytes)?;
             self.frame.clear();
             self.frame.resize(size, 0);
             read_exact_or_trunc(&mut self.inner, &mut self.frame)?;
@@ -506,5 +510,22 @@ mod tests {
             BlockHeader::parse_frame(&bytes),
             Err(BzstError::ChecksumMismatch { frame: "block-header" })
         ));
+    }
+
+    #[test]
+    fn oversized_uncompressed_size_is_rejected_before_allocating() {
+        // A block header with a valid checksum but a forged, huge uncompressed_size
+        // and a tiny compressed frame must be rejected on the uncompressed side —
+        // compressed alone is well under the cap — proving both sizes are checked
+        // before the decode buffer would be allocated.
+        let header = BlockHeader {
+            compressed_size: 8,
+            uncompressed_size: 1 << 40,
+            flags: BlockFlags::default(),
+        };
+        let mut bytes = header.to_frame_bytes().to_vec();
+        bytes.extend_from_slice(&[0u8; 8]); // placeholder for the (unread) data frame
+        let mut fr = FrameReader::new(std::io::Cursor::new(bytes), 1 << 20); // 1 MiB cap
+        assert!(matches!(fr.next_frame(), Err(BzstError::BlockTooLarge { .. })));
     }
 }
