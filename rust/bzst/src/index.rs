@@ -12,6 +12,9 @@ use crate::{xxh64, BzstError, BzstResult, EOF_MAGIC, STRUCTURAL_MAGIC, SUBTYPE_I
 
 /// Bytes per on-disk index entry (three `u64`s).
 const ENTRY_LEN: usize = 24;
+/// Fixed bytes before the entries: magic(4) + frame_size(4) + subtype(1) +
+/// index_flags(1) + entry_count(8) + total_uncompressed(8).
+const FIXED_HEAD: usize = 4 + 4 + 1 + 1 + 8 + 8;
 /// Fixed bytes after the entries: checksum(8) + index_offset(8) + eof_magic(4).
 const FIXED_TAIL: usize = 8 + 8 + 4;
 /// Bytes of the EOF trailer (index_offset + eof_magic).
@@ -150,8 +153,7 @@ impl Index {
     }
 
     pub(crate) fn parse_frame(f: &[u8]) -> BzstResult<Self> {
-        const HEAD: usize = 26; // magic(4)+size(4)+subtype(1)+flags(1)+count(8)+total(8)
-        if f.len() < HEAD + FIXED_TAIL {
+        if f.len() < FIXED_HEAD + FIXED_TAIL {
             return Err(BzstError::Truncated);
         }
         let magic = u32::from_le_bytes(f[0..4].try_into().unwrap());
@@ -165,7 +167,7 @@ impl Index {
         let entry_count = u64::from_le_bytes(f[10..18].try_into().unwrap()) as usize;
         let total = u64::from_le_bytes(f[18..26].try_into().unwrap());
         let entries_len = entry_count.checked_mul(ENTRY_LEN).ok_or(BzstError::IndexTooLarge)?;
-        let entries_end = HEAD.checked_add(entries_len).ok_or(BzstError::IndexTooLarge)?;
+        let entries_end = FIXED_HEAD.checked_add(entries_len).ok_or(BzstError::IndexTooLarge)?;
         let frame_min = entries_end.checked_add(FIXED_TAIL).ok_or(BzstError::IndexTooLarge)?;
         if f.len() < frame_min {
             return Err(BzstError::CorruptIndex);
@@ -175,7 +177,7 @@ impl Index {
             return Err(BzstError::CorruptIndex);
         }
         let stored = u64::from_le_bytes(f[entries_end..entries_end + 8].try_into().unwrap());
-        if xxh64(&f[9..entries_end]) != stored {
+        if xxh64(&f[..entries_end]) != stored {
             return Err(BzstError::CorruptIndex);
         }
         if index_flags != 0 {
@@ -187,7 +189,7 @@ impl Index {
         let mut entries = Vec::new();
         entries.try_reserve(entry_count).map_err(|_| BzstError::IndexTooLarge)?;
         for i in 0..entry_count {
-            let b = HEAD + i * ENTRY_LEN;
+            let b = FIXED_HEAD + i * ENTRY_LEN;
             entries.push(IndexEntry {
                 uncompressed_offset: u64::from_le_bytes(f[b..b + 8].try_into().unwrap()),
                 block_offset: u64::from_le_bytes(f[b + 8..b + 16].try_into().unwrap()),
@@ -218,26 +220,28 @@ impl Index {
     pub(crate) fn to_frame_bytes(&self, index_offset: u64) -> BzstResult<Vec<u8>> {
         let entries_len =
             self.entries.len().checked_mul(ENTRY_LEN).ok_or(BzstError::IndexTooLarge)?;
-        // Checksummed region: index_flags + entry_count + total + entries.
-        let mut checked = Vec::with_capacity(1 + 8 + 8 + entries_len);
-        checked.push(0u8); // index_flags: uncompressed entries in v1
-        checked.extend_from_slice(&(self.entries.len() as u64).to_le_bytes());
-        checked.extend_from_slice(&self.total_uncompressed.to_le_bytes());
-        for e in &self.entries {
-            checked.extend_from_slice(&e.uncompressed_offset.to_le_bytes());
-            checked.extend_from_slice(&e.block_offset.to_le_bytes());
-            checked.extend_from_slice(&e.block_length.to_le_bytes());
-        }
-        let cksum = xxh64(&checked);
-        let frame_size = 1 + checked.len() + FIXED_TAIL; // subtype + checked + tail
-        let frame_size: u32 = frame_size.try_into().map_err(|_| BzstError::IndexTooLarge)?;
+        let total_len =
+            entries_len.checked_add(FIXED_HEAD + FIXED_TAIL).ok_or(BzstError::IndexTooLarge)?;
+        // Frame_Size counts everything after the magic and Frame_Size itself.
+        let frame_size: u32 = (total_len - 8).try_into().map_err(|_| BzstError::IndexTooLarge)?;
 
-        let mut f = Vec::with_capacity(8 + frame_size as usize);
+        let mut f = Vec::with_capacity(total_len);
         f.extend_from_slice(&STRUCTURAL_MAGIC.to_le_bytes());
         f.extend_from_slice(&frame_size.to_le_bytes());
         f.push(SUBTYPE_INDEX);
-        f.extend_from_slice(&checked);
-        f.extend_from_slice(&cksum.to_le_bytes());
+        f.push(0u8); // index_flags: uncompressed entries in v1
+        f.extend_from_slice(&(self.entries.len() as u64).to_le_bytes());
+        f.extend_from_slice(&self.total_uncompressed.to_le_bytes());
+        for e in &self.entries {
+            f.extend_from_slice(&e.uncompressed_offset.to_le_bytes());
+            f.extend_from_slice(&e.block_offset.to_le_bytes());
+            f.extend_from_slice(&e.block_length.to_le_bytes());
+        }
+        // As in the header and block-header frames, the checksum covers every
+        // preceding byte of the frame. The trailer that follows is outside it,
+        // guarded instead by EOF_MAGIC and the frame's span to end-of-file.
+        let cksum = xxh64(&f).to_le_bytes();
+        f.extend_from_slice(&cksum);
         f.extend_from_slice(&index_offset.to_le_bytes());
         f.extend_from_slice(&EOF_MAGIC.to_le_bytes());
         Ok(f)
@@ -286,6 +290,41 @@ mod tests {
         f[10..18].copy_from_slice(&(u64::MAX / 8).to_le_bytes()); // poisoned entry_count
         f[42..46].copy_from_slice(&EOF_MAGIC.to_le_bytes());
         assert!(matches!(Index::parse_frame(&f), Err(BzstError::IndexTooLarge)));
+    }
+
+    /// Two entries' worth of a well-formed index, for corrupting in place.
+    fn sample_frame() -> Vec<u8> {
+        Index {
+            entries: vec![
+                IndexEntry { uncompressed_offset: 0, block_offset: 28, block_length: 50 },
+                IndexEntry { uncompressed_offset: 100, block_offset: 78, block_length: 50 },
+            ],
+            total_uncompressed: 200,
+        }
+        .to_frame_bytes(0)
+        .unwrap()
+    }
+
+    #[test]
+    fn index_checksum_covers_frame_size() {
+        let mut f = sample_frame();
+        // Frame_Size, which parse_frame does not otherwise read.
+        f[4] ^= 0xFF;
+        assert!(matches!(Index::parse_frame(&f), Err(BzstError::CorruptIndex)));
+    }
+
+    #[test]
+    fn index_checksum_covers_entries() {
+        let mut f = sample_frame();
+        // The first entry's block_offset: entries start at 26, and this field is
+        // not shape-validated, so only the checksum can catch a flip here.
+        f[34] ^= 0xFF;
+        assert!(matches!(Index::parse_frame(&f), Err(BzstError::CorruptIndex)));
+    }
+
+    #[test]
+    fn intact_index_round_trips() {
+        assert!(Index::parse_frame(&sample_frame()).is_ok());
     }
 
     #[test]
