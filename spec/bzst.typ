@@ -248,6 +248,10 @@ A reader seeks to `EOF − 12`, reads these twelve bytes, checks `EOF_Magic`, th
 
 #note[Provisional `EOF_Magic` `0x8F92EA5B` echoes the `seekable_format` sentinel family (`0x8F92EAB1`) while being distinct; final value is @issue-magic. Using an absolute `Index_Offset` (rather than a distance-from-EOF) is simplest for a single file but interacts with concatenation (@issue-concat).]
 
+For space efficiency, the index itself is stored using variable sized integer encoding, which harms random access.  However the index entries are themselves index in a "sub-index" which is stored using fixed size entries and thus random accessible.  No limitation is set on the frequency of sub-indices, but it can be considered to be a pointer to a "page" of compressed index entries.
+
+Implementations can either decode the entire index on load, or decode only the sub-index and on query then load the relevant portion of the full index on demand.
+
 == Index frame contents
 
 #layout(
@@ -256,14 +260,27 @@ A reader seeks to `EOF − 12`, reads these twelve bytes, checks `EOF_Magic`, th
   ([1], [`Subtype`], [`0x02`], [Index.]),
   ([1], [`Index_Flags`], [`u8`], [Bit 0: `Entries` blob is `zstd`-compressed. Bits 1–7 reserved (`0x0`).]),
   ([8], [`Entry_Count`], [`u64`], [Number of blocks (= number of entries).]),
+  ([4], [`Sub_Entry_Count`], [`u32`], [Number of index pointers (random access index).]),
   ([8], [`Total_Uncompressed`], [`u64`], [Sum of all blocks' uncompressed sizes; the end sentinel for search.]),
+  ([varies], [`Sub_Entries`], [see below], [`Sub_Entry_Count` entries; offsets into Entry data]),
   ([varies], [`Entries`], [see below], [`Entry_Count` entries; `zstd`-compressed iff `Index_Flags` bit 0.]),
   ([8], [`Checksum`], [`u64`], [XXH64 over the *uncompressed* `Entries` plus the fixed fields above.]),
   ([8], [`Index_Offset`], [`u64`], [Trailer (see above).]),
   ([4], [`EOF_Magic`], [`0x8F92EA5B`], [Trailer; last bytes of the file.]),
 )
 
-Each entry, in block order, is 24 bytes:
+Each sub-entry, in block order, is 12 bytes.
+The `Uncompressed_Offset` overwrites the delta field in the pointed-to
+main Entry table.  `Index_Offset` is relative to the first main index
+Entry, so the first Sub-entry index will have `Index_Offset` zero.
+
+#layout(
+  ([8], [`Uncompressed_Offset`], [`u64`], [Uncompressed byte offset at which this block's decoded data begins. (Binary-search key.)]),
+  ([4], [`Index_Offset`], [`u32`], [Relative byte offset from start of Entry array.]),
+)
+
+
+Each entry, in block order, is variable length encoded using 7-bit + _extend_ encoding and a delta against the previous values (starting at zero).
 
 #layout(
   ([8], [`Uncompressed_Offset`], [`u64`], [Uncompressed byte offset at which this block's decoded data begins. (Binary-search key.)]),
