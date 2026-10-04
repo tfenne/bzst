@@ -14,7 +14,7 @@ use std::io::{Read, Write};
 use crate::frame::{EncodedBlock, Frame, FrameReader, FrameWriter, Header};
 use crate::index::IndexBuilder;
 use crate::memory::default_alloc_limit;
-use crate::{BzstError, BzstResult, Profiles};
+use crate::{BzstError, BzstResult, Profiles, DEFAULT_INDEX_PARTITION_ENTRIES};
 
 /// Concatenates `inputs` into a single bzst stream written to `out`, copying
 /// every data block verbatim (no decompression or re-compression) and rebuilding
@@ -59,14 +59,18 @@ pub fn concat<R: Read, W: Write>(inputs: impl IntoIterator<Item = R>, out: W) ->
                 Some(Frame::Block { header, data }) => {
                     let block = EncodedBlock { header, data: data.to_vec() };
                     let offset = fw.write_encoded_block(&block)?;
-                    index.push(offset, block.on_disk_len(), block.header.uncompressed_size);
+                    index.push(
+                        offset,
+                        block.on_disk_len(),
+                        u64::from(block.header.uncompressed_size),
+                    );
                 }
                 // Derived-format (and unknown) frames are opaque to bzst; copy
                 // them through in place.
                 Some(Frame::Skippable(frame)) => fw.write_skippable(frame.magic, frame.payload)?,
                 // Each input's own bzst index is dropped; the combined index is
                 // rebuilt from the blocks we copy.
-                Some(Frame::Index(_)) => {}
+                Some(Frame::Index { .. }) => {}
                 // A second header inside one stream is malformed.
                 Some(Frame::Header(_)) => {
                     return Err(BzstError::Malformed("unexpected second header frame"))
@@ -78,7 +82,7 @@ pub fn concat<R: Read, W: Write>(inputs: impl IntoIterator<Item = R>, out: W) ->
     if !header_written {
         fw.write_header(&Header::new([0; 4], Profiles::BASELINE))?;
     }
-    fw.write_index(&index.finish())?;
+    fw.write_index(&index.finish(), DEFAULT_INDEX_PARTITION_ENTRIES)?;
     fw.flush()?;
     Ok(fw.into_inner())
 }

@@ -31,7 +31,7 @@ mod writer;
 
 pub use concat::concat;
 pub use frame::{BlockFlags, BlockHeader, Frames, Header, OwnedFrame, Profiles};
-pub use index::{Index, IndexEntry};
+pub use index::{Index, IndexEntry, LazyIndex};
 pub use reader::{BzstReader, BzstReaderBuilder, SeekableReader};
 pub use threads::{Pool, Threads};
 pub use writer::{BzstWriter, BzstWriterBuilder};
@@ -41,7 +41,7 @@ use std::io::{self, Read, Write};
 
 // --- wire constants --------------------------------------------------------
 
-/// bzst structural skippable-frame magic. **Provisional** (spec open issue §10.3).
+/// bzst structural skippable-frame magic. **Provisional** (spec open issue: magic-number selection).
 pub const STRUCTURAL_MAGIC: u32 = 0x184D_2A5B;
 /// EOF sentinel; the last four bytes of a complete file. **Provisional**.
 pub const EOF_MAGIC: u32 = 0x8F92_EA5B;
@@ -66,6 +66,11 @@ pub const ZSTD_FRAME_MAGIC: u32 = 0xFD2F_B528;
 
 /// Default per-block uncompressed size (1 MiB).
 pub const DEFAULT_BLOCK_SIZE: usize = 1 << 20;
+/// Largest uncompressed block the format can describe: block sizes are `u32`.
+pub const MAX_BLOCK_SIZE: usize = u32::MAX as usize;
+/// Default number of blocks described by each compressed index partition; at
+/// 12 bytes per block this keeps a decompressed partition at 48 KiB.
+pub const DEFAULT_INDEX_PARTITION_ENTRIES: usize = 4096;
 /// Default zstd compression level (matches `ZSTD_CLEVEL_DEFAULT`).
 pub const DEFAULT_LEVEL: i32 = 3;
 
@@ -107,6 +112,9 @@ pub enum BzstError {
     BadSkippableMagic(u32),
     /// The index does not fit in a single skippable frame (billions of blocks).
     IndexTooLarge,
+    /// A block, or the frames between two blocks, exceeds what the format can
+    /// describe (sizes are `u32`, so just under 4 GiB). Names the quantity.
+    ExceedsFormatLimit(&'static str),
     /// A worker thread pool could not be constructed.
     Thread(String),
 }
@@ -134,6 +142,9 @@ impl fmt::Display for BzstError {
                 write!(f, "skippable magic {m:#010x} is out of range or reserved by bzst")
             }
             BzstError::IndexTooLarge => write!(f, "index too large for a single frame"),
+            BzstError::ExceedsFormatLimit(what) => {
+                write!(f, "{what} exceeds the format's 4 GiB per-block limit")
+            }
             BzstError::Thread(msg) => write!(f, "thread pool error: {msg}"),
         }
     }

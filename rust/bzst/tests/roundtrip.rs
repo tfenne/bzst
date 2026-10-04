@@ -144,3 +144,9 @@ fn many_writes_reassemble_correctly() {
     let bytes = w.finish().unwrap();
     assert_eq!(bzst::decompress(&bytes).unwrap(), expected);
 }
+
+#[test]
+fn block_size_beyond_the_format_limit_is_rejected() {
+    let result = BzstWriter::builder(Vec::new()).block_size(bzst::MAX_BLOCK_SIZE + 1).build();
+    assert!(matches!(result, Err(bzst::BzstError::ExceedsFormatLimit(_))));
+}
