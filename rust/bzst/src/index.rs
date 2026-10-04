@@ -8,15 +8,15 @@ use std::io::{Read, Seek, SeekFrom};
 
 use crate::frame::{block_on_disk_len, Frame, FrameReader};
 use crate::memory::default_alloc_limit;
-use crate::{xxh64, BzstError, BzstResult, EOF_MAGIC, STRUCTURAL_MAGIC, SUBTYPE_INDEX};
+use crate::{crc32, BzstError, BzstResult, EOF_MAGIC, STRUCTURAL_MAGIC, SUBTYPE_INDEX};
 
 /// Bytes per on-disk index entry (three `u64`s).
 const ENTRY_LEN: usize = 24;
 /// Fixed bytes before the entries: magic(4) + frame_size(4) + subtype(1) +
 /// index_flags(1) + entry_count(8) + total_uncompressed(8).
 const FIXED_HEAD: usize = 4 + 4 + 1 + 1 + 8 + 8;
-/// Fixed bytes after the entries: checksum(8) + index_offset(8) + eof_magic(4).
-const FIXED_TAIL: usize = 8 + 8 + 4;
+/// Fixed bytes after the entries: checksum(4) + index_offset(8) + eof_magic(4).
+const FIXED_TAIL: usize = 4 + 8 + 4;
 /// Bytes of the EOF trailer (index_offset + eof_magic).
 pub(crate) const EOF_TRAILER_LEN: usize = 12;
 
@@ -176,8 +176,8 @@ impl Index {
         if eof != EOF_MAGIC {
             return Err(BzstError::CorruptIndex);
         }
-        let stored = u64::from_le_bytes(f[entries_end..entries_end + 8].try_into().unwrap());
-        if xxh64(&f[..entries_end]) != stored {
+        let stored = u32::from_le_bytes(f[entries_end..entries_end + 4].try_into().unwrap());
+        if crc32(&f[..entries_end]) != stored {
             return Err(BzstError::CorruptIndex);
         }
         if index_flags != 0 {
@@ -240,7 +240,7 @@ impl Index {
         // As in the header and block-header frames, the checksum covers every
         // preceding byte of the frame. The trailer that follows is outside it,
         // guarded instead by EOF_MAGIC and the frame's span to end-of-file.
-        let cksum = xxh64(&f).to_le_bytes();
+        let cksum = crc32(&f).to_le_bytes();
         f.extend_from_slice(&cksum);
         f.extend_from_slice(&index_offset.to_le_bytes());
         f.extend_from_slice(&EOF_MAGIC.to_le_bytes());
@@ -283,12 +283,12 @@ mod tests {
     fn crafted_entry_count_overflow_errors_not_panics() {
         // A minimal index frame whose entry_count would overflow the length
         // arithmetic; parsing must return IndexTooLarge, not panic.
-        let mut f = vec![0u8; 46]; // HEAD(26) + FIXED_TAIL(20)
+        let mut f = vec![0u8; 42]; // HEAD(26) + FIXED_TAIL(16)
         f[0..4].copy_from_slice(&STRUCTURAL_MAGIC.to_le_bytes());
-        f[4..8].copy_from_slice(&38u32.to_le_bytes());
+        f[4..8].copy_from_slice(&34u32.to_le_bytes());
         f[8] = SUBTYPE_INDEX;
         f[10..18].copy_from_slice(&(u64::MAX / 8).to_le_bytes()); // poisoned entry_count
-        f[42..46].copy_from_slice(&EOF_MAGIC.to_le_bytes());
+        f[38..42].copy_from_slice(&EOF_MAGIC.to_le_bytes());
         assert!(matches!(Index::parse_frame(&f), Err(BzstError::IndexTooLarge)));
     }
 
@@ -296,8 +296,8 @@ mod tests {
     fn sample_frame() -> Vec<u8> {
         Index {
             entries: vec![
-                IndexEntry { uncompressed_offset: 0, block_offset: 28, block_length: 50 },
-                IndexEntry { uncompressed_offset: 100, block_offset: 78, block_length: 50 },
+                IndexEntry { uncompressed_offset: 0, block_offset: 24, block_length: 50 },
+                IndexEntry { uncompressed_offset: 100, block_offset: 74, block_length: 50 },
             ],
             total_uncompressed: 200,
         }
@@ -333,8 +333,8 @@ mod tests {
         // the offset arithmetic can't underflow.
         let index = Index {
             entries: vec![
-                IndexEntry { uncompressed_offset: 100, block_offset: 28, block_length: 50 },
-                IndexEntry { uncompressed_offset: 50, block_offset: 78, block_length: 50 },
+                IndexEntry { uncompressed_offset: 100, block_offset: 24, block_length: 50 },
+                IndexEntry { uncompressed_offset: 50, block_offset: 74, block_length: 50 },
             ],
             total_uncompressed: 200,
         };

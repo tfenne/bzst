@@ -83,8 +83,8 @@ fn written_index_matches_forward_rebuild() {
     assert_eq!(read.total_uncompressed(), data.len() as u64);
     assert_eq!(read.total_uncompressed(), rebuilt.total_uncompressed());
     assert_eq!(read.entries(), rebuilt.entries());
-    // First block starts right after the header frame (28 bytes).
-    assert_eq!(read.entry(0).unwrap().block_offset, 28);
+    // First block starts right after the header frame (24 bytes).
+    assert_eq!(read.entry(0).unwrap().block_offset, 24);
     assert_eq!(read.entry(0).unwrap().uncompressed_offset, 0);
 }
 

@@ -12,7 +12,7 @@ repository = "https://github.com/tfenne/bzst"
 [workspace.dependencies]
 zstd = "0.13"
 rayon = "1"
-xxhash-rust = { version = "0.8", features = ["xxh64"] }
+crc32fast = "1.5"
 libc = "0.2"
 
 [profile.release]
