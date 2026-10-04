@@ -1,0 +1,147 @@
+name: Check and Test
+
+on:
+  push:
+    branches:
+      - main
+  # No branch filter: stacked PRs target feature branches, not just main.
+  pull_request:
+
+# A force-push or rapid follow-up commit supersedes in-flight runs of the
+# same ref; don't burn runners finishing stale ones.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Every job only checks out the repo and runs read-only build/test/lint steps.
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  SCCACHE_GHA_ENABLED: "true"
+  RUSTC_WRAPPER: "sccache"
+
+# The Rust jobs run from `rust/`, where the workspace, its `ci-*` aliases and
+# `rust-toolchain.toml` live. The toolchain installed by dtolnay/rust-toolchain
+# is only a bootstrap: the first cargo call in `rust/` makes rustup install and
+# use the pinned toolchain (and its components) from `rust-toolchain.toml`.
+jobs:
+  # Linux and macOS: the library's memory query (`bzst/src/memory.rs`) has a
+  # separate implementation per OS.
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: rust
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - name: Install pinned toolchain (rust-toolchain.toml)
+        run: |
+          cargo --version
+          rustup show active-toolchain
+      - name: Set up compilation cache (sccache)
+        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+      # The interop tests shell out to the stock `zstd` CLI and skip themselves
+      # (passing) when it is missing, so install it and fail loudly if it is
+      # still not on PATH rather than let the job pass without running them.
+      - name: Install zstd (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y zstd
+      - name: Install zstd (macOS)
+        if: runner.os == 'macOS'
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: "1"
+        run: brew install zstd
+      - name: Verify zstd is on PATH
+        run: zstd --version
+      - name: Unit and integration tests
+        run: cargo ci-test
+
+  # Both OSes for the same reason as `test`: clippy only sees the
+  # `cfg(target_os)` branch for the OS it runs on.
+  lint:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: rust
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          components: clippy
+      - name: Install pinned toolchain (rust-toolchain.toml)
+        run: |
+          cargo --version
+          rustup show active-toolchain
+      - name: Set up compilation cache (sccache)
+        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+      - name: Clippy check
+        run: cargo ci-clippy
+
+  format:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: rust
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          components: rustfmt
+      - name: Install pinned toolchain (rust-toolchain.toml)
+        run: |
+          cargo --version
+          rustup show active-toolchain
+      - name: Set up compilation cache (sccache)
+        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+      - name: Rustfmt check
+        run: cargo ci-fmt
+
+  # The committed spec/bzst.pdf embeds its build date, so it is never diffed
+  # here: this checks the spec compiles and uploads the rendering for review.
+  spec:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Typst
+        uses: typst-community/setup-typst@fee4b65b091cc546f02ce3be15fad8760f38a108 # v5.3.0
+        with:
+          typst-version: "0.15.1"
+      - name: Compile spec
+        run: typst compile spec/bzst.typ "$RUNNER_TEMP/bzst.pdf"
+      - name: Upload rendered spec
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: bzst-spec
+          path: ${{ runner.temp }}/bzst.pdf
+          if-no-files-found: error

@@ -1,0 +1,34 @@
+name: Supply chain (cargo-deny)
+
+# Runs on every PR (so a PR that adds a problematic dep fails review) and
+# on a weekly cron (so a newly published advisory against an existing dep
+# surfaces even on a quiet repo). Decoupled from the main test/lint
+# workflow so an advisory drop on Friday doesn't red-flag unrelated PRs.
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  schedule:
+    - cron: "0 12 * * 1" # Mondays 12:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  cargo-deny:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # The workspace (and deny.toml) live under rust/, not the repo root.
+      - name: Run cargo-deny
+        uses: EmbarkStudios/cargo-deny-action@bb137d7af7e4fb67e5f82a49c4fce4fad40782fe # v2.0.20
+        with:
+          manifest-path: rust/Cargo.toml
+          command: check advisories licenses bans sources
