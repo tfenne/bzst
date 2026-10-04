@@ -12,6 +12,6 @@ name = "bzst"
 path = "src/main.rs"
 
 [dependencies]
-bzst = { path = "../bzst" }
+bzst = { path = "../bzst", version = "0.1.0" }
 clap = { version = "4", features = ["derive"] }
 anyhow = "1"
