@@ -6,14 +6,14 @@ Status: **early but working.** The core format (baseline profile) round-trips, i
 
 ## Workspace
 
-- **`bzst/`** — the library crate. Depends on `zstd` (C libzstd), `rayon`, `xxhash-rust`, and `libc` (host-memory query used to bound per-block allocations against corrupt size fields).
+- **`bzst/`** — the library crate. Depends on `zstd` (C libzstd), `rayon`, `crc32fast`, and `libc` (host-memory query used to bound per-block allocations against corrupt size fields).
 - **`bzst-cli/`** — the `bzst` binary: a single, gzip/bgzip-style tool (compress by default; `-d`, `-t`, `--list`, `--cat`).
 
 ## Quickstart
 
 ```sh
 cargo build --release
-cargo test                     # 69 tests
+cargo test                     # 76 tests
 cargo ci-fmt && cargo ci-clippy && cargo ci-test   # the CI gate set
 
 # CLI — gzip/bgzip-style: compresses in place by default, removing the input.
@@ -65,7 +65,7 @@ The zstd codec and raw frame I/O are internal (`pub(crate)`); the public surface
 - Baseline profile: header / block-header / data / index frames, per the spec's provisional layout and magic numbers.
 - Serial + pipelined-parallel writer and reader (own-threads or a shared `Pool`): blocks (de)compress on worker threads while the calling thread does ordered I/O, so compute overlaps I/O and the parallel output is byte-identical to serial.
 - Seekable random access with absolute-offset index; `Index::read_from` (EOF trailer) and `Index::rebuild` (forward pass) agree.
-- Structural-frame XXH64 checksums; data-frame zstd content checksums (on by default).
+- Structural-frame CRC32 checksums (zlib's `crc32()`); data-frame zstd content checksums (on by default).
 - Robust decode: truncation is detected (a stream missing its trailing index errors instead of silently returning partial output), corrupt or oversized block sizes are rejected with a clean `BlockTooLarge` error rather than an OOM abort (capped at ~95% of host RAM), and a corrupt-but-present index is transparently rebuilt from the block-header frames.
 - Derived-format skippable-frame injection (`write_skippable_frame`) and reading (`Frames`).
 - Verbatim `cat` (`bzst::concat`): concatenates files by copying compressed blocks (and derived-format skippable frames) through with no recompression, regenerating a single combined header and index.

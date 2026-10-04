@@ -123,6 +123,8 @@ The key words #MUST, #MUSTNOT, #SHOULD, #SHOULDNOT, and #MAY are to be interpret
 
 All multi-byte integers are *unsigned* and *little-endian*, matching the Zstandard frame format and existing genomics tooling. `u8`, `u16`, `u32`, `u64` denote unsigned integers of that width.
 
+*CRC32* denotes the CRC-32 computed by zlib's `crc32()` and used by gzip (RFC 1952) and PNG, catalogued as CRC-32/ISO-HDLC: polynomial `0x04C11DB7` (`0xEDB88320` bit-reflected), initial value `0xFFFFFFFF`, input and output bit-reflected, final XOR `0xFFFFFFFF`. Its check value is CRC32(`"123456789"`) = `0xCBF43926`. Every bzst structural-frame checksum is a CRC32, stored as a `u32`.
+
 / Frame: A Zstandard frame as defined by RFC 8878: either a _data frame_ (magic `0xFD2FB528`) or a _skippable frame_ (magic `0x184D2A50`–`0x184D2A5F`).
 / Skippable frame: A frame carrying an opaque payload that a conformant Zstandard decoder skips. Its wire form is a 4-byte magic, a 4-byte `u32` `Frame_Size`, and `Frame_Size` bytes of user data.
 / Data frame: An ordinary Zstandard (or, in a future profile, other-codec) frame carrying compressed payload.
@@ -178,7 +180,7 @@ The header frame #MUST be the first frame in the file. It makes the file recogni
   ([4], [`Format_Signature`], [`u32` / tag], [Opaque 4-byte derived-format tag; `0x00000000` = none (generic bzst). bzst never interprets it (@derived).]),
   ([1], [`Profiles`], [`u8`], [Bitmask of profiles used anywhere in the file (@profiles). `0x00` = baseline.]),
   ([1], [`Flags`], [`u8`], [Reserved; #MUST be `0x00` and #MUST be ignored on read.]),
-  ([8], [`Checksum`], [`u64`], [XXH64 of all preceding bytes of this frame.]),
+  ([4], [`Checksum`], [`u32`], [CRC32 of all preceding bytes of this frame.]),
 )
 
 *Recognition.* A file is bzst if its first four bytes are a Zstandard skippable magic and the four bytes at offset 10 are `"BZST"`. A derived format additionally checks the four bytes at offset 14 against its `Format_Signature`; together these form a fixed 8-byte type magic `[BZST][tag]` that a tool such as `file`/libmagic can match. The test is cheap, is robust to the leading skippable frame being ignored by generic tools, and does not collide with a plain `zstd` file (whose first bytes are the data-frame magic `0xFD2FB528`).
@@ -206,7 +208,7 @@ The block-header frame carries the sizes needed to place and decode the followin
   ([8], [`Compressed_Size`], [`u64`], [Exact on-disk size of the following data frame.]),
   ([8], [`Uncompressed_Size`], [`u64`], [Size of the following data frame's decoded output.]),
   ([1], [`Flags`], [`u8`], [Bit 0: `Stored` (advisory; see @data-frame). Bits 1–7 reserved (`0x0`).]),
-  ([4], [`Checksum`], [`u32`], [Low 32 bits of XXH64 over all preceding bytes of this frame; the trailing 4 bytes, located via `Frame_Size`.]),
+  ([4], [`Checksum`], [`u32`], [CRC32 over all preceding bytes of this frame; the trailing 4 bytes, located via `Frame_Size`.]),
 )
 
 #todo[Integer width of `Compressed_Size` / `Uncompressed_Size` (u64 here) is @issue-int. Whether the block-header checksum should be mandatory, optional (flag-gated), or dropped in favour of the data frame's own content checksum is @issue-ck.]
@@ -258,7 +260,7 @@ A reader seeks to `EOF − 12`, reads these twelve bytes, checks `EOF_Magic`, th
   ([8], [`Entry_Count`], [`u64`], [Number of blocks (= number of entries).]),
   ([8], [`Total_Uncompressed`], [`u64`], [Sum of all blocks' uncompressed sizes; the end sentinel for search.]),
   ([varies], [`Entries`], [see below], [`Entry_Count` entries; `zstd`-compressed iff `Index_Flags` bit 0.]),
-  ([8], [`Checksum`], [`u64`], [XXH64 over the *uncompressed* `Entries` plus the fixed fields above.]),
+  ([4], [`Checksum`], [`u32`], [CRC32 over the *uncompressed* `Entries` plus the fixed fields above.]),
   ([8], [`Index_Offset`], [`u64`], [Trailer (see above).]),
   ([4], [`EOF_Magic`], [`0x8F92EA5B`], [Trailer; last bytes of the file.]),
 )
@@ -373,7 +375,7 @@ Whether the per-block block-header checksum should be mandatory (as drafted), fl
 - *The index addresses the block-header frame and stores [uncompressed_offset, block_offset, block_length].* _Why:_ one read fetches block header + data together and carries the uncompressed size needed to pre-size the buffer, with no size duplicated except the block length.
 - *Inline block-header frames are the source of truth*; the index is a reconstructible accelerator. A missing/damaged index never breaks the file.
 - *Derived indices anchor on the bzst index* (@derived-index) by forward-reading the trailing gap; no bzst support required.
-- *Little-endian throughout; XXH64 for structural checksums*; recommend `zstd` content checksums on data frames. _Why:_ speed is irrelevant at our scale, so consistency with `zstd` and a single hash implementation win.
+- *Little-endian throughout; CRC32 for structural checksums*; recommend `zstd` content checksums on data frames. _Why:_ CRC32 ships with zlib and with the standard libraries of many languages, whereas libzstd does not expose its XXH64 through its public API, so XXH64 would force a separate xxHash dependency on most implementations; speed is irrelevant at our scale.
 - *Block size is the writer's choice*, bounded only by the size field's type; no min/max imposed.
 - *No record straddles a block* — a recommendation at the bzst level, a #SHOULDNOT for record-based derived formats (softened from #MUSTNOT: unforeseen use cases may need otherwise).
 
@@ -400,7 +402,7 @@ This design builds directly on: the Zstandard format and its `pzstd` and `seekab
 - `zeekstd` seekable format. #link("https://github.com/rorosen/zeekstd")
 - BGZF2 proposal (J. Bonfield). #link("https://github.com/jkbonfield/htslib/blob/bgzf2/BGZF2.md")
 - OpenZL. #link("https://github.com/facebook/openzl") and paper arXiv:2510.03203. #link("https://arxiv.org/abs/2510.03203")
-- xxHash (XXH64). #link("https://xxhash.com")
+- RFC 1952 — GZIP File Format Specification version 4.3 (defines CRC-32, with sample code). #link("https://www.rfc-editor.org/rfc/rfc1952")
 
 = Appendix A — Reference tooling wishlist (informative) <tooling>
 

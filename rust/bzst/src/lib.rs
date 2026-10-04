@@ -194,7 +194,19 @@ pub fn decompress(src: &[u8]) -> BzstResult<Vec<u8>> {
     Ok(out)
 }
 
-// XXH64 over `bytes`, seed 0 — the hash used for all structural-frame checksums.
-pub(crate) fn xxh64(bytes: &[u8]) -> u64 {
-    xxhash_rust::xxh64::xxh64(bytes, 0)
+// CRC32 over `bytes`, identical to zlib's `crc32()` — the checksum used for all
+// structural frames.
+pub(crate) fn crc32(bytes: &[u8]) -> u32 {
+    crc32fast::hash(bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::crc32;
+
+    #[test]
+    fn crc32_matches_the_standard_check_value() {
+        // The published check value for CRC-32/ISO-HDLC (zlib, gzip, PNG).
+        assert_eq!(crc32(b"123456789"), 0xCBF4_3926);
+    }
 }

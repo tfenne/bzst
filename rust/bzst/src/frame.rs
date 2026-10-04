@@ -11,13 +11,13 @@ use crate::codec::ZstdCompressor;
 use crate::index::Index;
 use crate::memory::{check_block_fits, default_alloc_limit};
 use crate::{
-    xxh64, BzstError, BzstResult, FORMAT_VERSION, SIGNATURE, SKIPPABLE_MAGIC_MAX,
+    crc32, BzstError, BzstResult, FORMAT_VERSION, SIGNATURE, SKIPPABLE_MAGIC_MAX,
     SKIPPABLE_MAGIC_MIN, STRUCTURAL_MAGIC, SUBTYPE_BLOCK_HEADER, SUBTYPE_HEADER, SUBTYPE_INDEX,
     ZSTD_FRAME_MAGIC,
 };
 
 /// On-disk length of a header frame.
-pub(crate) const HEADER_FRAME_LEN: usize = 28;
+pub(crate) const HEADER_FRAME_LEN: usize = 24;
 /// On-disk length of a block-header frame.
 pub(crate) const BLOCK_HEADER_FRAME_LEN: usize = 30;
 /// Length of a skippable-frame envelope (magic + u32 size).
@@ -239,8 +239,8 @@ impl Header {
         f[14..18].copy_from_slice(&self.format_signature);
         f[18] = self.profiles.bits();
         f[19] = 0; // reserved flags
-        let cksum = xxh64(&f[0..20]);
-        f[20..28].copy_from_slice(&cksum.to_le_bytes());
+        let cksum = crc32(&f[0..20]);
+        f[20..24].copy_from_slice(&cksum.to_le_bytes());
         f
     }
 
@@ -259,8 +259,8 @@ impl Header {
                 found: u32::from_le_bytes(sig),
             });
         }
-        let stored = u64::from_le_bytes(f[20..28].try_into().unwrap());
-        if xxh64(&f[0..20]) != stored {
+        let stored = u32::from_le_bytes(f[20..24].try_into().unwrap());
+        if crc32(&f[0..20]) != stored {
             return Err(BzstError::ChecksumMismatch { frame: "header" });
         }
         let version = f[9];
@@ -296,7 +296,7 @@ impl BlockHeader {
         f[9..17].copy_from_slice(&self.compressed_size.to_le_bytes());
         f[17..25].copy_from_slice(&self.uncompressed_size.to_le_bytes());
         f[25] = self.flags.bits();
-        let cksum = xxh64(&f[0..26]) as u32;
+        let cksum = crc32(&f[0..26]);
         f[26..30].copy_from_slice(&cksum.to_le_bytes());
         f
     }
@@ -306,7 +306,7 @@ impl BlockHeader {
             return Err(BzstError::Truncated);
         }
         let stored = u32::from_le_bytes(f[26..30].try_into().unwrap());
-        if xxh64(&f[0..26]) as u32 != stored {
+        if crc32(&f[0..26]) != stored {
             return Err(BzstError::ChecksumMismatch { frame: "block-header" });
         }
         Ok(Self {
@@ -486,6 +486,23 @@ pub(crate) fn block_on_disk_len(compressed_size: u64) -> u64 {
 mod tests {
     use super::*;
     use crate::BzstError;
+
+    #[test]
+    fn header_frame_matches_zlib_crc32_bytes() {
+        // Expected bytes computed independently with Python's `zlib.crc32`, so this
+        // pins the on-disk checksum to zlib's CRC32 rather than to our own helper.
+        #[rustfmt::skip]
+        let expected: [u8; HEADER_FRAME_LEN] = [
+            0x5B, 0x2A, 0x4D, 0x18, // structural magic
+            0x10, 0x00, 0x00, 0x00, // Frame_Size = 16
+            0x00, 0x01,             // subtype, format version
+            0x42, 0x5A, 0x53, 0x54, // "BZST"
+            0x00, 0x00, 0x00, 0x00, // Format_Signature (none)
+            0x00, 0x00,             // profiles, flags
+            0x64, 0xCB, 0xC6, 0x5D, // CRC32 of the 20 bytes above
+        ];
+        assert_eq!(Header::new([0; 4], Profiles::BASELINE).to_frame_bytes(), expected);
+    }
 
     #[test]
     fn header_checksum_flip_is_detected() {
