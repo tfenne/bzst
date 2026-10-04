@@ -325,7 +325,8 @@ A reader #MUST treat the index as corrupt, and #MAY rebuild it by a forward pass
 - The partitions are contiguous: the first begins immediately after `Subtype`, each begins where the previous one ends, and the last ends where the directory begins.
 - Every partition has `Entry_Count` ≥ 1, and the partitions' counts sum to the frame's `Entry_Count`. An empty index has `Partition_Count` = 0 and `Total_Uncompressed` = 0.
 - `Blocks_End` ≤ `Index_Offset`, and the last partition's last block ends exactly at `Blocks_End`.
-- Each partition declares, and decompresses with a valid content checksum to, exactly 12 × `Entry_Count` bytes; every `Uncompressed_Size` is non-zero; and the first entry's `Derived_Frames_Length` is 0.
+- Each partition declares, and decompresses with a valid content checksum to, exactly 12 × `Entry_Count` bytes; every `Uncompressed_Size` is non-zero; every `Block_Length` is at least the 22-byte block-header frame; and the first entry's `Derived_Frames_Length` is 0.
+- `Entry_Count` is at most (`Blocks_End` − 24) / 22, the most blocks that fit after the header frame. A reader checks this before decoding any partition, so a crafted, highly compressible partition cannot make the decoded index much larger than the file.
 - The first partition's `First_Uncompressed_Offset` is 0; each partition's `Uncompressed_Size` values sum to the next partition's `First_Uncompressed_Offset` minus its own (`Total_Uncompressed` closes the last partition); and each partition's last block ends at or before the next partition's `First_Block_Offset`.
 
 A reader that loads only some partitions checks the rules that involve what it has read.

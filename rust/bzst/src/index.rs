@@ -15,7 +15,9 @@
 use std::io::{Read, Seek, SeekFrom};
 
 use crate::codec::{ZstdCompressor, ZstdDecompressor};
-use crate::frame::{block_on_disk_len, Frame, FrameReader, HEADER_FRAME_LEN};
+use crate::frame::{
+    block_on_disk_len, Frame, FrameReader, BLOCK_HEADER_FRAME_LEN, HEADER_FRAME_LEN,
+};
 use crate::memory::default_alloc_limit;
 use crate::{
     crc32, BzstError, BzstResult, DEFAULT_LEVEL, EOF_MAGIC, STRUCTURAL_MAGIC, SUBTYPE_INDEX,
@@ -579,7 +581,10 @@ impl Partition {
         let mut block_offset = self.first_block_offset;
         for i in 0..count {
             let (size, derived_length, block_length) = (column(0, i), column(1, i), column(2, i));
-            if size == 0 || (i == 0 && derived_length != 0) {
+            if size == 0
+                || block_length < BLOCK_HEADER_FRAME_LEN as u64
+                || (i == 0 && derived_length != 0)
+            {
                 return Err(BzstError::CorruptIndex);
             }
             block_offset =
@@ -639,7 +644,12 @@ fn validate_directory(
     partitions_start: u64,
     directory_start: u64,
 ) -> BzstResult<()> {
-    if tail.blocks_end > tail.index_offset {
+    // Every block is at least a block-header frame, so no more entries fit before
+    // Blocks_End than this; checking first keeps the decoded index proportional
+    // to the file, however compressible a crafted partition is.
+    let max_entries =
+        tail.blocks_end.saturating_sub(HEADER_FRAME_LEN as u64) / BLOCK_HEADER_FRAME_LEN as u64;
+    if tail.blocks_end > tail.index_offset || tail.entry_count > max_entries {
         return Err(BzstError::CorruptIndex);
     }
     let Some(first) = directory.first() else {
@@ -962,6 +972,22 @@ mod tests {
     fn zero_uncompressed_size_is_rejected() {
         let frame = crafted_frame(&[(0, 24, &[10, 0, 20], &[0, 0, 0], &[30, 30, 30])], 30);
         assert!(matches!(parse(&frame), Err(BzstError::CorruptIndex)));
+    }
+
+    #[test]
+    fn block_shorter_than_its_header_is_rejected() {
+        let frame = crafted_frame(&[(0, 24, &[10, 20], &[0, 0], &[30, 21])], 30);
+        assert!(matches!(parse(&frame), Err(BzstError::CorruptIndex)));
+    }
+
+    #[test]
+    fn more_entries_than_fit_before_blocks_end_are_rejected_on_open() {
+        // Three blocks claimed, but Blocks_End leaves room for only two minimal ones.
+        let mut frame = crafted_frame(&[(0, 24, &[1, 1, 1], &[0, 0, 0], &[22, 22, 22])], 3);
+        let room_for_two = HEADER_FRAME_LEN as u64 + 2 * BLOCK_HEADER_FRAME_LEN as u64;
+        rewrite_tail_field(&mut frame, 16, &room_for_two.to_le_bytes());
+        let result = LazyIndex::open(Cursor::new(file_of(&frame)));
+        assert!(matches!(result, Err(BzstError::CorruptIndex)));
     }
 
     #[test]

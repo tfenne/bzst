@@ -13,7 +13,7 @@ Status: **early but working.** The core format (baseline profile) round-trips, i
 
 ```sh
 cargo build --release
-cargo test                     # 112 tests
+cargo test                     # 114 tests
 cargo ci-fmt && cargo ci-clippy && cargo ci-test   # the CI gate set
 
 # CLI — gzip/bgzip-style: compresses in place by default, removing the input.
