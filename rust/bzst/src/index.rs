@@ -15,7 +15,7 @@
 use std::io::{Read, Seek, SeekFrom};
 
 use crate::codec::{ZstdCompressor, ZstdDecompressor};
-use crate::frame::{block_on_disk_len, Frame, FrameReader};
+use crate::frame::{block_on_disk_len, Frame, FrameReader, HEADER_FRAME_LEN};
 use crate::memory::default_alloc_limit;
 use crate::{
     crc32, BzstError, BzstResult, DEFAULT_LEVEL, EOF_MAGIC, STRUCTURAL_MAGIC, SUBTYPE_INDEX,
@@ -29,8 +29,9 @@ const HEAD_LEN: usize = 4 + 4 + 1;
 /// offset(8) + partition offset(8) + partition length(4) + entry count(4).
 const DIRECTORY_ENTRY_LEN: usize = 32;
 /// Fixed fields between the directory and the checksum, which the checksum also
-/// covers: entry_count(8) + total_uncompressed(8) + partition_count(4).
-const COUNTS_LEN: usize = 8 + 8 + 4;
+/// covers: entry_count(8) + total_uncompressed(8) + blocks_end(8) +
+/// partition_count(4).
+const COUNTS_LEN: usize = 8 + 8 + 8 + 4;
 /// Bytes of the EOF trailer (index_offset + eof_magic).
 pub(crate) const EOF_TRAILER_LEN: usize = 12;
 /// Everything after the directory: counts + checksum(4) + EOF trailer.
@@ -154,6 +155,13 @@ impl Index {
         self.total_uncompressed
     }
 
+    /// File offset just past the last block (the end of the header frame if there
+    /// are no blocks). Frames a derived format writes after its last block lie
+    /// between here and the index frame.
+    pub fn blocks_end(&self) -> u64 {
+        self.entries.last().map_or(HEADER_FRAME_LEN as u64, |e| e.block_offset + e.block_length)
+    }
+
     /// Index of the block containing uncompressed byte `offset`, if in range.
     pub fn block_for_offset(&self, offset: u64) -> Option<usize> {
         if offset >= self.total_uncompressed {
@@ -253,6 +261,7 @@ impl Index {
             u32::try_from(directory.len()).map_err(|_| BzstError::IndexTooLarge)?;
         f.extend_from_slice(&(self.entries.len() as u64).to_le_bytes());
         f.extend_from_slice(&self.total_uncompressed.to_le_bytes());
+        f.extend_from_slice(&self.blocks_end().to_le_bytes());
         f.extend_from_slice(&partition_count.to_le_bytes());
         // The checksum covers the directory and counts: the region a reader gets
         // from one read of the file's tail. Partitions carry zstd content checksums.
@@ -339,6 +348,18 @@ impl<R: Read + Seek> LazyIndex<R> {
     /// Total uncompressed size of the file.
     pub fn total_uncompressed(&self) -> u64 {
         self.tail.total_uncompressed
+    }
+
+    /// File offset just past the last block (the end of the header frame if there
+    /// are no blocks). With [`LazyIndex::index_offset`] it brackets the frames a
+    /// derived format wrote after its last block.
+    pub fn blocks_end(&self) -> u64 {
+        self.tail.blocks_end
+    }
+
+    /// File offset of the index frame.
+    pub fn index_offset(&self) -> u64 {
+        self.tail.index_offset
     }
 
     /// Number of index partitions.
@@ -440,6 +461,7 @@ impl<R: Read + Seek> LazyIndex<R> {
 struct IndexTail {
     entry_count: u64,
     total_uncompressed: u64,
+    blocks_end: u64,
     partition_count: u32,
     checksum: u32,
     index_offset: u64,
@@ -453,10 +475,11 @@ impl IndexTail {
         Self {
             entry_count: u64::from_le_bytes(t[0..8].try_into().unwrap()),
             total_uncompressed: u64::from_le_bytes(t[8..16].try_into().unwrap()),
-            partition_count: u32::from_le_bytes(t[16..20].try_into().unwrap()),
-            checksum: u32::from_le_bytes(t[20..24].try_into().unwrap()),
-            index_offset: u64::from_le_bytes(t[24..32].try_into().unwrap()),
-            eof_magic: u32::from_le_bytes(t[32..36].try_into().unwrap()),
+            blocks_end: u64::from_le_bytes(t[16..24].try_into().unwrap()),
+            partition_count: u32::from_le_bytes(t[24..28].try_into().unwrap()),
+            checksum: u32::from_le_bytes(t[28..32].try_into().unwrap()),
+            index_offset: u64::from_le_bytes(t[32..40].try_into().unwrap()),
+            eof_magic: u32::from_le_bytes(t[40..44].try_into().unwrap()),
         }
     }
 
@@ -567,13 +590,13 @@ impl Partition {
             block_offset = block_offset.checked_add(block_length).ok_or(BzstError::CorruptIndex)?;
         }
         // The sizes must reach exactly where the next partition (or the data)
-        // begins, and the blocks must end before the next partition's first block
-        // (or the index frame) does.
-        let (uncompressed_end, blocks_end_limit) = match next {
-            Some(next) => (next.first_uncompressed_offset, next.first_block_offset),
-            None => (tail.total_uncompressed, tail.index_offset),
+        // begins, and the blocks must end no later than the next partition's first
+        // block, or, for the last partition, exactly at Blocks_End.
+        let (uncompressed_end, blocks_end_valid) = match next {
+            Some(next) => (next.first_uncompressed_offset, block_offset <= next.first_block_offset),
+            None => (tail.total_uncompressed, block_offset == tail.blocks_end),
         };
-        if uncompressed_offset != uncompressed_end || block_offset > blocks_end_limit {
+        if uncompressed_offset != uncompressed_end || !blocks_end_valid {
             return Err(BzstError::CorruptIndex);
         }
         Ok(())
@@ -608,13 +631,17 @@ impl IndexBuilder {
 
 /// Checks the directory's internal consistency: partitions are non-empty and
 /// contiguous from `partitions_start` to `directory_start`, their counts sum to
-/// the index's, and their first offsets start at zero and increase.
+/// the index's, their first offsets start at zero and increase, and the blocks
+/// end before the index frame begins.
 fn validate_directory(
     directory: &[Partition],
     tail: &IndexTail,
     partitions_start: u64,
     directory_start: u64,
 ) -> BzstResult<()> {
+    if tail.blocks_end > tail.index_offset {
+        return Err(BzstError::CorruptIndex);
+    }
     let Some(first) = directory.first() else {
         return match tail.entry_count == 0 && tail.total_uncompressed == 0 {
             true => Ok(()),
@@ -640,7 +667,10 @@ fn validate_directory(
         && entries == tail.entry_count
         && first.first_uncompressed_offset == 0
         && increasing
-        && directory.last().is_some_and(|p| p.first_uncompressed_offset < tail.total_uncompressed);
+        && directory.last().is_some_and(|p| {
+            p.first_uncompressed_offset < tail.total_uncompressed
+                && p.first_block_offset < tail.blocks_end
+        });
     match valid {
         true => Ok(()),
         false => Err(BzstError::CorruptIndex),
@@ -692,7 +722,7 @@ mod tests {
 
     /// Offset within `frame` of the directory, from its partition count.
     fn directory_start(frame: &[u8]) -> usize {
-        let count_at = frame.len() - TAIL_LEN + 16;
+        let count_at = frame.len() - TAIL_LEN + 24;
         let count = u32::from_le_bytes(frame[count_at..count_at + 4].try_into().unwrap());
         frame.len() - TAIL_LEN - count as usize * DIRECTORY_ENTRY_LEN
     }
@@ -711,8 +741,11 @@ mod tests {
         let mut zc = ZstdCompressor::new(DEFAULT_LEVEL, true).unwrap();
         let mut directory = Vec::new();
         let mut entry_count = 0u64;
+        let mut blocks_end = HEADER_FRAME_LEN as u64;
         for &(first_uncompressed_offset, first_block_offset, sizes, derived, lengths) in partitions
         {
+            let sum = |column: &[u32]| column.iter().map(|&v| u64::from(v)).sum::<u64>();
+            blocks_end = first_block_offset + sum(lengths) + sum(&derived[1..]);
             let columns: Vec<u8> =
                 [sizes, derived, lengths].concat().iter().flat_map(|v| v.to_le_bytes()).collect();
             let mut compressed = vec![0u8; ZstdCompressor::bound(columns.len())];
@@ -731,6 +764,7 @@ mod tests {
         directory.iter().for_each(|p| p.write_to(&mut f));
         f.extend_from_slice(&entry_count.to_le_bytes());
         f.extend_from_slice(&total.to_le_bytes());
+        f.extend_from_slice(&blocks_end.to_le_bytes());
         f.extend_from_slice(&(directory.len() as u32).to_le_bytes());
         let checksum = crc32(&f[checked_start..]);
         f.extend_from_slice(&checksum.to_le_bytes());
@@ -739,6 +773,17 @@ mod tests {
         let frame_size = (f.len() - 8) as u32;
         f[4..8].copy_from_slice(&frame_size.to_le_bytes());
         f
+    }
+
+    /// Overwrites the tail field `at` bytes into the tail with `bytes`, then
+    /// recomputes the checksum so only the field's value is wrong.
+    fn rewrite_tail_field(frame: &mut [u8], at: usize, bytes: &[u8]) {
+        let tail_start = frame.len() - TAIL_LEN;
+        frame[tail_start + at..tail_start + at + bytes.len()].copy_from_slice(bytes);
+        let directory_at = directory_start(frame);
+        let checksum = crc32(&frame[directory_at..tail_start + COUNTS_LEN]);
+        frame[tail_start + COUNTS_LEN..tail_start + COUNTS_LEN + 4]
+            .copy_from_slice(&checksum.to_le_bytes());
     }
 
     fn parse(frame: &[u8]) -> BzstResult<Index> {
@@ -816,6 +861,52 @@ mod tests {
     }
 
     #[test]
+    fn checksum_covers_blocks_end() {
+        let mut frame = frame_of(&sample_index(300, 0), 64);
+        let blocks_end_at = frame.len() - TAIL_LEN + 16;
+        frame[blocks_end_at] ^= 0x01;
+        assert!(matches!(parse(&frame), Err(BzstError::CorruptIndex)));
+    }
+
+    #[test]
+    fn blocks_end_is_the_end_of_the_last_block() {
+        let index = sample_index(300, 7);
+        let last = index.entries().last().unwrap();
+        assert_eq!(index.blocks_end(), last.block_offset + last.block_length);
+        let lazy = LazyIndex::open(Cursor::new(file_of(&frame_of(&index, 64)))).unwrap();
+        assert_eq!(lazy.blocks_end(), index.blocks_end());
+        assert_eq!(lazy.index_offset(), INDEX_OFFSET);
+    }
+
+    #[test]
+    fn empty_index_blocks_end_is_the_end_of_the_header() {
+        let index = Index::default();
+        assert_eq!(index.blocks_end(), HEADER_FRAME_LEN as u64);
+        let lazy = LazyIndex::open(Cursor::new(file_of(&frame_of(&index, 64)))).unwrap();
+        assert_eq!(lazy.blocks_end(), HEADER_FRAME_LEN as u64);
+    }
+
+    #[test]
+    fn blocks_end_must_match_the_last_block() {
+        let index = sample_index(300, 0);
+        let mut frame = frame_of(&index, 64);
+        rewrite_tail_field(&mut frame, 16, &(index.blocks_end() + 1).to_le_bytes());
+        assert!(matches!(parse(&frame), Err(BzstError::CorruptIndex)));
+        // A lazy reader catches it on reaching the last partition.
+        let mut lazy = LazyIndex::open(Cursor::new(file_of(&frame))).unwrap();
+        let last_offset = index.entries().last().unwrap().uncompressed_offset;
+        assert!(matches!(lazy.entry_for_offset(last_offset), Err(BzstError::CorruptIndex)));
+    }
+
+    #[test]
+    fn blocks_end_beyond_the_index_is_rejected() {
+        let mut frame = frame_of(&sample_index(300, 0), 64);
+        rewrite_tail_field(&mut frame, 16, &(INDEX_OFFSET + 1).to_le_bytes());
+        let result = LazyIndex::open(Cursor::new(file_of(&frame)));
+        assert!(matches!(result, Err(BzstError::CorruptIndex)));
+    }
+
+    #[test]
     fn corrupt_partition_is_detected() {
         let mut frame = frame_of(&sample_index(300, 0), 64);
         // Inside the first partition's compressed body, past its zstd header.
@@ -842,7 +933,7 @@ mod tests {
     #[test]
     fn crafted_partition_count_errors_not_panics() {
         let mut frame = frame_of(&Index::default(), 64);
-        let count_at = frame.len() - TAIL_LEN + 16;
+        let count_at = frame.len() - TAIL_LEN + 24;
         frame[count_at..count_at + 4].copy_from_slice(&u32::MAX.to_le_bytes());
         assert!(matches!(parse(&frame), Err(BzstError::CorruptIndex)));
     }
@@ -923,11 +1014,7 @@ mod tests {
         let mut frame = crafted_frame(&[(0, 24, &[10], &[0], &[30])], 10);
         let directory_at = directory_start(&frame);
         frame[directory_at + 28..directory_at + 32].copy_from_slice(&u32::MAX.to_le_bytes());
-        let count_at = frame.len() - TAIL_LEN;
-        frame[count_at..count_at + 8].copy_from_slice(&u64::from(u32::MAX).to_le_bytes());
-        let checksum = crc32(&frame[directory_at..frame.len() - TAIL_LEN + COUNTS_LEN]);
-        let checksum_at = frame.len() - TAIL_LEN + COUNTS_LEN;
-        frame[checksum_at..checksum_at + 4].copy_from_slice(&checksum.to_le_bytes());
+        rewrite_tail_field(&mut frame, 0, &u64::from(u32::MAX).to_le_bytes());
         assert!(matches!(parse(&frame), Err(BzstError::CorruptIndex)));
     }
 

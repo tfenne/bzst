@@ -213,3 +213,39 @@ fn read_range_across_derived_frames() {
     assert_eq!(sr.read_range(123_456, &mut buf).unwrap(), buf.len());
     assert_eq!(buf, data[123_456..128_456]);
 }
+
+#[test]
+fn trailing_derived_frames_lie_between_blocks_end_and_the_index() {
+    const DERIVED_MAGIC: u32 = 0x184D_2A50;
+    let data = pseudo_text(100_000, 35);
+    let mut w = BzstWriter::builder(Vec::new()).block_size(10_000).build().unwrap();
+    w.write_all(&data).unwrap();
+    // A derived index after the last block, ending in a fixed-size footer (here,
+    // its own length) so a reader can also find it by reading backward.
+    let derived_index = b"a derived coordinate index".to_vec();
+    let mut payload = derived_index.clone();
+    payload.extend_from_slice(&(derived_index.len() as u64).to_le_bytes());
+    w.write_skippable_frame(DERIVED_MAGIC, &payload).unwrap();
+    let bytes = w.finish().unwrap();
+
+    let lazy = LazyIndex::open(std::io::Cursor::new(&bytes)).unwrap();
+    let (start, end) = (lazy.blocks_end() as usize, lazy.index_offset() as usize);
+    assert_eq!(end - start, 8 + payload.len(), "only the derived frame lies between them");
+
+    // Forward: the derived frame starts exactly at blocks_end.
+    assert_eq!(u32::from_le_bytes(bytes[start..start + 4].try_into().unwrap()), DERIVED_MAGIC);
+    assert_eq!(&bytes[start + 8..end - 8], derived_index);
+
+    // Backward: the footer just before the index locates the payload.
+    let len = u64::from_le_bytes(bytes[end - 8..end].try_into().unwrap()) as usize;
+    assert_eq!(&bytes[end - 8 - len..end - 8], derived_index);
+}
+
+#[test]
+fn blocks_end_equals_index_offset_without_trailing_frames() {
+    let bytes = write_file(&pseudo_text(100_000, 36), 10_000);
+    let lazy = LazyIndex::open(std::io::Cursor::new(&bytes)).unwrap();
+    assert_eq!(lazy.blocks_end(), lazy.index_offset());
+    let index = Index::read_from(&mut std::io::Cursor::new(&bytes)).unwrap();
+    assert_eq!(index.blocks_end(), lazy.blocks_end());
+}

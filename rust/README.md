@@ -13,7 +13,7 @@ Status: **early but working.** The core format (baseline profile) round-trips, i
 
 ```sh
 cargo build --release
-cargo test                     # 105 tests
+cargo test                     # 112 tests
 cargo ci-fmt && cargo ci-clippy && cargo ci-test   # the CI gate set
 
 # CLI — gzip/bgzip-style: compresses in place by default, removing the input.
@@ -68,7 +68,7 @@ The zstd codec and raw frame I/O are internal (`pub(crate)`); the public surface
 
 - Baseline profile: header / block-header / data / index frames, per the spec's provisional layout and magic numbers.
 - Serial + pipelined-parallel writer and reader (own-threads or a shared `Pool`): blocks (de)compress on worker threads while the calling thread does ordered I/O, so compute overlaps I/O and the parallel output is byte-identical to serial.
-- Partitioned, zstd-compressed index: per-block `u32` columns in partitions of 4,096 blocks by default (`index_partition_entries` / `--index-partition-entries`), with a fixed-width directory at the end of the file. `Index::read_from` decodes it all; `LazyIndex` reads only the file's tail and one partition per lookup. `Index::read_from` and `Index::rebuild` (forward pass) agree.
+- Partitioned, zstd-compressed index: per-block `u32` columns in partitions of 4,096 blocks by default (`index_partition_entries` / `--index-partition-entries`), with a fixed-width directory at the end of the file. `Index::read_from` decodes it all; `LazyIndex` reads only the file's tail and one partition per lookup. The index tail also records `Blocks_End`, so `blocks_end()` and `index_offset()` bracket any frames a derived format wrote after its last block. `Index::read_from` and `Index::rebuild` (forward pass) agree.
 - Block sizes are `u32`, so a block is limited to just under 4 GiB; the writer reports anything larger as `ExceedsFormatLimit`.
 - Seekable random access (`SeekableReader`) over the uncompressed stream.
 - Structural-frame CRC32 checksums (zlib's `crc32()`); data-frame zstd content checksums (on by default).

@@ -264,13 +264,14 @@ A reader seeks to `EOF − 12`, reads these twelve bytes and checks `EOF_Magic`;
   ([varies], [`Directory`], [see below], [32 bytes per partition, in partition order (@index-directory).]),
   ([8], [`Entry_Count`], [`u64`], [Number of blocks (= number of entries across all partitions).]),
   ([8], [`Total_Uncompressed`], [`u64`], [Sum of all blocks' uncompressed sizes; the end sentinel for search.]),
+  ([8], [`Blocks_End`], [`u64`], [File offset just past the last block's data frame (the end of the header frame if there are no blocks).]),
   ([4], [`Partition_Count`], [`u32`], [Number of partitions (= number of directory entries).]),
   ([4], [`Checksum`], [`u32`], [CRC32 over the bytes from the start of `Directory` to the end of `Partition_Count`.]),
   ([8], [`Index_Offset`], [`u64`], [Trailer (see above).]),
   ([4], [`EOF_Magic`], [`0x8F92EA5B`], [Trailer; last bytes of the file.]),
 )
 
-Everything a reader needs to plan a lookup sits at the end of the frame: the directory and the fixed fields occupy the last 36 + 32 × `Partition_Count` bytes of the file. A reader that fetches the tail of the file (say its last 64 KiB) obtains the trailer, the counts and the whole directory in one read, then fetches a single partition per lookup. `Checksum` covers exactly that contiguous region, so it can be verified without reading any partition; each partition is protected by its own `zstd` content checksum. The leading envelope fields are validated by value instead (@index-validation); there is no index flags or version field, because the header's `Format_Version` already governs how the whole file, index included, is interpreted.
+Everything a reader needs to plan a lookup sits at the end of the frame: the directory and the fixed fields occupy the last 44 + 32 × `Partition_Count` bytes of the file. A reader that fetches the tail of the file (say its last 64 KiB) obtains the trailer, the counts and the whole directory in one read, then fetches a single partition per lookup. `Blocks_End` and `Index_Offset` together bracket whatever was written after the last block and before the index, so derived formats can find their trailing frames from the same read (@derived-index). `Checksum` covers exactly that contiguous region, so it can be verified without reading any partition; each partition is protected by its own `zstd` content checksum. The leading envelope fields are validated by value instead (@index-validation); there is no index flags or version field, because the header's `Format_Version` already governs how the whole file, index included, is interpreted.
 
 Logically the index holds one entry per block, in block order:
 
@@ -323,6 +324,7 @@ A reader #MUST treat the index as corrupt, and #MAY rebuild it by a forward pass
 - `Magic_Number`, `Subtype` and `EOF_Magic` match; the frame begins at `Index_Offset` and ends at the end of the file; and `Checksum` matches.
 - The partitions are contiguous: the first begins immediately after `Subtype`, each begins where the previous one ends, and the last ends where the directory begins.
 - Every partition has `Entry_Count` ≥ 1, and the partitions' counts sum to the frame's `Entry_Count`. An empty index has `Partition_Count` = 0 and `Total_Uncompressed` = 0.
+- `Blocks_End` ≤ `Index_Offset`, and the last partition's last block ends exactly at `Blocks_End`.
 - Each partition declares, and decompresses with a valid content checksum to, exactly 12 × `Entry_Count` bytes; every `Uncompressed_Size` is non-zero; and the first entry's `Derived_Frames_Length` is 0.
 - The first partition's `First_Uncompressed_Offset` is 0; each partition's `Uncompressed_Size` values sum to the next partition's `First_Uncompressed_Offset` minus its own (`Total_Uncompressed` closes the last partition); and each partition's last block ends at or before the next partition's `First_Block_Offset`.
 
@@ -369,13 +371,12 @@ bzst provides the compression container; a derived format provides meaning. The 
 
 == Anchoring a derived index on the bzst index <derived-index>
 
-A derived format that wants its own trailing index (e.g. a genomic coordinate index) can locate it using the bzst index frame as a structural anchor, requiring no bzst support:
+A derived format that wants its own trailing index (e.g. a genomic coordinate index) places its frames after the last block, where the bzst writer then appends the index. A reader finds them from the same read of the file's tail that it uses for the bzst index:
 
-+ Find the bzst index via the EOF trailer (@index): read `Index_Offset`.
-+ Read the bzst index's directory and decode its last partition. The last entry gives the end of the last data block, `last_block_end = Block_Offset + Block_Length`.
-+ Everything in the gap `[last_block_end, Index_Offset)` is whatever the derived format wrote after the last block and before the bzst index — for example its coordinate index frame(s). Because skippable frames are self-delimiting *forward* (magic + `Frame_Size`), the reader simply reads that gap forward to discover them.
++ Read the tail of the file (@index-layout): the trailer gives `Index_Offset` and the index's fixed fields give `Blocks_End`.
++ Everything in `[Blocks_End, Index_Offset)` is what the derived format wrote after the last block and before the bzst index — for example its coordinate index frame(s). The two offsets are equal when nothing was written there.
 
-No backward seek or derived back-pointer is required; the derived format need only place its frames in that trailing gap. This is a concrete demonstration of the two-layer split: the derived (semantic) index and the bzst (compression) index coexist, each self-contained, with bzst unaware of the former.
+A reader can then go either way. *Forward:* skippable frames are self-delimiting forward (magic + `Frame_Size`), so it reads the region from `Blocks_End`. *Backward:* frames cannot be walked backward, so a derived format that wants to jump straight to a payload #SHOULD end its last frame with a fixed-size footer of its own (e.g. the payload's absolute offset followed by an identifying magic), which a reader fetches from just before `Index_Offset`. bzst writes `Blocks_End` itself and never reads the region, so derived formats need no bzst support. This is a concrete demonstration of the two-layer split: the derived (semantic) index and the bzst (compression) index coexist, each self-contained, with bzst unaware of the former.
 
 = Recommendations (non-normative) <recommendations>
 
@@ -422,7 +423,7 @@ Whether the per-block block-header checksum should be mandatory (as drafted), fl
 - *A partitioned, `zstd`-compressed index with a fixed-width directory at the end*, and no other index encoding. Partitions store per-block sizes as `u32` columns; the directory anchors each partition with absolute `u64` offsets. _Why:_ a lookup reads the file's tail and one small partition (two reads on high-latency storage) without loading the whole index; on the genomic data measured the index is about 4–7× smaller than fixed 24-byte entries; and implementers need nothing beyond the `zstd` they already have, little-endian integers and running sums — no variable-length integer codec.
 - *The index addresses the block-header frame*; each logical entry is [uncompressed_offset, block_offset, block_length]. _Why:_ one read fetches block header + data together and carries the uncompressed size needed to pre-size the buffer, with no size duplicated except the block length.
 - *Inline block-header frames are the source of truth*; the index is a reconstructible accelerator. A missing/damaged index never breaks the file.
-- *Derived indices anchor on the bzst index* (@derived-index) by forward-reading the trailing gap; no bzst support required.
+- *The index records `Blocks_End`*, which with `Index_Offset` brackets the region after the last block where derived formats put their own trailing frames (@derived-index). _Why:_ one tail read then locates both the bzst index and any derived index, and the writer knows the value itself; no derived-format value passes through bzst.
 - *Little-endian throughout; CRC32 for structural checksums*; recommend `zstd` content checksums on data frames. _Why:_ CRC32 ships with zlib and with the standard libraries of many languages, whereas libzstd does not expose its XXH64 through its public API, so XXH64 would force a separate xxHash dependency on most implementations; speed is irrelevant at our scale.
 - *`u32` block sizes.* Block-header sizes, and every per-block quantity in the index, are `u32`, so a block is limited to just under 4 GiB uncompressed and on disk. _Why:_ a 4 GiB block is useless for random access, `u32` matches `seekable_format`/`zeekstd` precedent, and it halves the size fields in every block header. Whole-file offsets stay `u64`.
 - *Block size is the writer's choice* within that limit; no minimum is imposed.
