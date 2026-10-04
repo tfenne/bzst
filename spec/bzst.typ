@@ -49,7 +49,8 @@
   #text(12pt)[A parallel, seekable, `zstd`-compatible container format] \
   #v(6pt)
   #text(10pt)[Working draft 0.1 — #datetime.today().display("[year]-[month]-[day]")] \
-  #text(10pt)[Editor: Tim Fennell]
+  #text(10pt)[Editor: Tim Fennell] \
+  #text(9pt)[© 2026 Tim Fennell. Licensed under #link("https://creativecommons.org/licenses/by/4.0/")[CC BY 4.0].]
 ]
 
 #v(4pt)
