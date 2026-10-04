@@ -19,7 +19,7 @@ use crate::{
 /// On-disk length of a header frame.
 pub(crate) const HEADER_FRAME_LEN: usize = 24;
 /// On-disk length of a block-header frame.
-pub(crate) const BLOCK_HEADER_FRAME_LEN: usize = 30;
+pub(crate) const BLOCK_HEADER_FRAME_LEN: usize = 22;
 /// Length of a skippable-frame envelope (magic + u32 size).
 const SKIPPABLE_HEADER_LEN: usize = 8;
 
@@ -66,8 +66,12 @@ impl<W: Write> FrameWriter<W> {
         Ok(())
     }
 
-    pub(crate) fn write_index(&mut self, index: &Index) -> BzstResult<()> {
-        let bytes = index.to_frame_bytes(self.pos)?;
+    pub(crate) fn write_index(
+        &mut self,
+        index: &Index,
+        partition_entries: usize,
+    ) -> BzstResult<()> {
+        let bytes = index.to_frame_bytes(self.pos, partition_entries)?;
         self.inner.write_all(&bytes)?;
         self.pos += bytes.len() as u64;
         Ok(())
@@ -107,6 +111,7 @@ impl<R: Read> FrameReader<R> {
     }
 
     pub(crate) fn next_frame(&mut self) -> BzstResult<Option<Frame<'_>>> {
+        let start = self.pos;
         let mut magic_buf = [0u8; 4];
         match read_full(&mut self.inner, &mut magic_buf)? {
             0 => return Ok(None),
@@ -137,21 +142,21 @@ impl<R: Read> FrameReader<R> {
                 SUBTYPE_BLOCK_HEADER => {
                     let header = BlockHeader::parse_frame(&self.frame)?;
                     check_block_fits(
-                        header.compressed_size,
-                        header.uncompressed_size,
+                        u64::from(header.compressed_size),
+                        u64::from(header.uncompressed_size),
                         self.max_block_bytes,
                     )?;
                     self.data.clear();
                     self.data.resize(header.compressed_size as usize, 0);
                     read_exact_or_trunc(&mut self.inner, &mut self.data)?;
-                    self.pos += header.compressed_size;
+                    self.pos += u64::from(header.compressed_size);
                     Ok(Some(Frame::Block { header, data: &self.data }))
                 }
                 // Recognize the index frame WITHOUT validating its body: a corrupt
                 // trailing index must not break the forward read path, since the
                 // block-header frames are the source of truth. Callers that need
                 // the parsed index (`Frames`, `Index::read_from`) validate it.
-                SUBTYPE_INDEX => Ok(Some(Frame::Index(&self.frame))),
+                SUBTYPE_INDEX => Ok(Some(Frame::Index { offset: start, raw: &self.frame })),
                 // Unknown structural subtype (a future version): surface it so
                 // callers can skip it; the `Read` path ignores non-Block frames.
                 _ => Ok(Some(Frame::Skippable(SkippableFrame {
@@ -186,15 +191,18 @@ pub(crate) struct EncodedBlock {
 }
 
 impl EncodedBlock {
-    /// Compresses `uncompressed` into one zstd data frame using `zc`.
+    /// Compresses `uncompressed` into one zstd data frame using `zc`. Fails if the
+    /// block is too large for the format's `u32` sizes.
     pub(crate) fn encode(zc: &mut ZstdCompressor, uncompressed: &[u8]) -> BzstResult<Self> {
+        let uncompressed_size = u32::try_from(uncompressed.len())
+            .map_err(|_| BzstError::ExceedsFormatLimit("a block's uncompressed size"))?;
         let mut data = vec![0u8; ZstdCompressor::bound(uncompressed.len())];
         let n = zc.compress(uncompressed, &mut data)?;
         data.truncate(n);
         Ok(Self {
             header: BlockHeader {
-                compressed_size: n as u64,
-                uncompressed_size: uncompressed.len() as u64,
+                compressed_size: checked_compressed_size(n)?,
+                uncompressed_size,
                 flags: BlockFlags::default(),
             },
             data,
@@ -203,7 +211,7 @@ impl EncodedBlock {
 
     /// On-disk length of the block (`[block-header frame][data frame]`).
     pub(crate) fn on_disk_len(&self) -> u64 {
-        block_on_disk_len(self.data.len() as u64)
+        block_on_disk_len(self.header.compressed_size)
     }
 }
 
@@ -280,9 +288,9 @@ impl Header {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BlockHeader {
     /// Exact on-disk size of the following data frame.
-    pub compressed_size: u64,
+    pub compressed_size: u32,
     /// Size of the following data frame's decoded output.
-    pub uncompressed_size: u64,
+    pub uncompressed_size: u32,
     /// Advisory per-block flags.
     pub flags: BlockFlags,
 }
@@ -293,11 +301,11 @@ impl BlockHeader {
         f[0..4].copy_from_slice(&STRUCTURAL_MAGIC.to_le_bytes());
         f[4..8].copy_from_slice(&((BLOCK_HEADER_FRAME_LEN - 8) as u32).to_le_bytes());
         f[8] = SUBTYPE_BLOCK_HEADER;
-        f[9..17].copy_from_slice(&self.compressed_size.to_le_bytes());
-        f[17..25].copy_from_slice(&self.uncompressed_size.to_le_bytes());
-        f[25] = self.flags.bits();
-        let cksum = crc32(&f[0..26]);
-        f[26..30].copy_from_slice(&cksum.to_le_bytes());
+        f[9..13].copy_from_slice(&self.compressed_size.to_le_bytes());
+        f[13..17].copy_from_slice(&self.uncompressed_size.to_le_bytes());
+        f[17] = self.flags.bits();
+        let cksum = crc32(&f[0..18]);
+        f[18..22].copy_from_slice(&cksum.to_le_bytes());
         f
     }
 
@@ -305,14 +313,14 @@ impl BlockHeader {
         if f.len() < BLOCK_HEADER_FRAME_LEN {
             return Err(BzstError::Truncated);
         }
-        let stored = u32::from_le_bytes(f[26..30].try_into().unwrap());
-        if crc32(&f[0..26]) != stored {
+        let stored = u32::from_le_bytes(f[18..22].try_into().unwrap());
+        if crc32(&f[0..18]) != stored {
             return Err(BzstError::ChecksumMismatch { frame: "block-header" });
         }
         Ok(Self {
-            compressed_size: u64::from_le_bytes(f[9..17].try_into().unwrap()),
-            uncompressed_size: u64::from_le_bytes(f[17..25].try_into().unwrap()),
-            flags: BlockFlags::from_bits(f[25]),
+            compressed_size: u32::from_le_bytes(f[9..13].try_into().unwrap()),
+            uncompressed_size: u32::from_le_bytes(f[13..17].try_into().unwrap()),
+            flags: BlockFlags::from_bits(f[17]),
         })
     }
 }
@@ -386,9 +394,12 @@ pub(crate) enum Frame<'a> {
         data: &'a [u8],
     },
     Skippable(SkippableFrame<'a>),
-    /// The raw bytes of the trailing index frame, parsed on demand — a corrupt
-    /// index must not fail the forward read path.
-    Index(&'a [u8]),
+    /// The raw bytes of the trailing index frame and the file offset it starts
+    /// at, parsed on demand — a corrupt index must not fail the forward read path.
+    Index {
+        offset: u64,
+        raw: &'a [u8],
+    },
 }
 
 impl Frame<'_> {
@@ -399,7 +410,7 @@ impl Frame<'_> {
             Frame::Skippable(s) => {
                 OwnedFrame::Skippable { magic: s.magic, payload: s.payload.to_vec() }
             }
-            Frame::Index(raw) => OwnedFrame::Index(Index::parse_frame(raw)?),
+            Frame::Index { offset, raw } => OwnedFrame::Index(Index::parse_frame(raw, *offset)?),
         })
     }
 }
@@ -478,8 +489,19 @@ fn read_exact_or_trunc<R: Read>(r: &mut R, buf: &mut [u8]) -> BzstResult<()> {
 
 /// On-disk length of a block (`[block-header frame][data frame]`) given the data
 /// frame's compressed size. Shared by the writer and by [`Index::rebuild`].
-pub(crate) fn block_on_disk_len(compressed_size: u64) -> u64 {
-    BLOCK_HEADER_FRAME_LEN as u64 + compressed_size
+pub(crate) fn block_on_disk_len(compressed_size: u32) -> u64 {
+    BLOCK_HEADER_FRAME_LEN as u64 + u64::from(compressed_size)
+}
+
+/// Converts a data frame's compressed size to the block header's `u32`, also
+/// requiring the whole block (header frame plus data frame) to fit a `u32`, since
+/// the index records every block's on-disk length as one.
+fn checked_compressed_size(compressed_len: usize) -> BzstResult<u32> {
+    compressed_len
+        .checked_add(BLOCK_HEADER_FRAME_LEN)
+        .and_then(|on_disk| u32::try_from(on_disk).ok())
+        .map(|_| compressed_len as u32)
+        .ok_or(BzstError::ExceedsFormatLimit("a block's on-disk length"))
 }
 
 #[cfg(test)]
@@ -537,12 +559,27 @@ mod tests {
         // before the decode buffer would be allocated.
         let header = BlockHeader {
             compressed_size: 8,
-            uncompressed_size: 1 << 40,
+            uncompressed_size: u32::MAX,
             flags: BlockFlags::default(),
         };
         let mut bytes = header.to_frame_bytes().to_vec();
         bytes.extend_from_slice(&[0u8; 8]); // placeholder for the (unread) data frame
         let mut fr = FrameReader::new(std::io::Cursor::new(bytes), 1 << 20); // 1 MiB cap
         assert!(matches!(fr.next_frame(), Err(BzstError::BlockTooLarge { .. })));
+    }
+
+    #[test]
+    fn largest_block_that_fits_a_u32_on_disk_is_accepted() {
+        let largest = u32::MAX as usize - BLOCK_HEADER_FRAME_LEN;
+        assert_eq!(checked_compressed_size(largest).unwrap(), largest as u32);
+    }
+
+    #[test]
+    fn block_too_large_for_a_u32_on_disk_is_rejected() {
+        let too_large = u32::MAX as usize - BLOCK_HEADER_FRAME_LEN + 1;
+        assert!(matches!(
+            checked_compressed_size(too_large),
+            Err(BzstError::ExceedsFormatLimit("a block's on-disk length"))
+        ));
     }
 }

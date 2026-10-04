@@ -80,6 +80,10 @@ struct Cli {
     #[arg(long, default_value_t = 1, value_name = "N")]
     lines_per_record: usize,
 
+    /// Blocks described by each compressed index partition.
+    #[arg(long, default_value_t = bzst::DEFAULT_INDEX_PARTITION_ENTRIES, value_name = "N")]
+    index_partition_entries: usize,
+
     /// Overwrite existing output files.
     #[arg(short, long)]
     force: bool,
@@ -234,13 +238,14 @@ fn compress(cli: &Cli, reader: Box<dyn BufRead>, writer: Box<dyn Write>) -> Resu
     let (text, mut reader) = resolve_text_mode(cli, reader)?;
     // In text mode the record splitter drives every block boundary via
     // end_block(); the writer must not also cut at block_size (that would split
-    // whichever record straddles the offset), so build it unbounded and let the
-    // splitter alone decide where blocks end.
-    let writer_block_size = if text { usize::MAX } else { cli.block_size };
+    // whichever record straddles the offset), so give it the largest block the
+    // format allows and let the splitter decide where blocks end.
+    let writer_block_size = if text { bzst::MAX_BLOCK_SIZE } else { cli.block_size };
     let mut w = BzstWriter::builder(writer)
         .level(cli.level)
         .block_size(writer_block_size)
         .threads(threads_of(cli.threads))
+        .index_partition_entries(cli.index_partition_entries)
         .build()
         .context("creating bzst writer")?;
     if text {

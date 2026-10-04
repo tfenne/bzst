@@ -384,3 +384,21 @@ fn text_mode_handles_trailing_partial_record() {
     let bytes = fs::read(dir.join("reads.fq.bzst")).unwrap();
     assert_eq!(bzst::decompress(&bytes).unwrap(), fastq, "trailing partial record must round-trip");
 }
+
+#[test]
+fn index_partition_entries_flag_sets_partition_size() {
+    let dir = scratch("index_partitions");
+    let data = text(20_000);
+    fs::write(dir.join("a.txt"), &data).unwrap();
+
+    let out = run(&dir, &["-k", "-b", "4096", "--index-partition-entries", "3", "a.txt"]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let archive = fs::read(dir.join("a.txt.bzst")).unwrap();
+    let blocks = Index::read_from(&mut Cursor::new(&archive)).unwrap().len();
+    let lazy = bzst::LazyIndex::open(Cursor::new(&archive)).unwrap();
+    assert_eq!(lazy.partition_count(), blocks.div_ceil(3));
+    assert_eq!(bzst::decompress(&archive).unwrap(), data);
+
+    let test = run(&dir, &["-t", "a.txt.bzst"]);
+    assert!(test.status.success(), "{}", String::from_utf8_lossy(&test.stderr));
+}

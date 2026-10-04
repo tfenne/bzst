@@ -49,7 +49,8 @@
   #text(12pt)[A parallel, seekable, `zstd`-compatible container format] \
   #v(6pt)
   #text(10pt)[Working draft 0.1 — #datetime.today().display("[year]-[month]-[day]")] \
-  #text(10pt)[Editor: Tim Fennell]
+  #text(10pt)[Editor: Tim Fennell] \
+  #text(9pt)[© 2026 Tim Fennell. Licensed under #link("https://creativecommons.org/licenses/by/4.0/")[CC BY 4.0].]
 ]
 
 #v(4pt)
@@ -205,13 +206,17 @@ The block-header frame carries the sizes needed to place and decode the followin
   ([4], [`Magic_Number`], [`0x184D2A5B`], [Structural-frame magic.]),
   ([4], [`Frame_Size`], [`u32`], [Bytes following.]),
   ([1], [`Subtype`], [`0x01`], [BlockHeader.]),
-  ([8], [`Compressed_Size`], [`u64`], [Exact on-disk size of the following data frame.]),
-  ([8], [`Uncompressed_Size`], [`u64`], [Size of the following data frame's decoded output.]),
+  ([4], [`Compressed_Size`], [`u32`], [Exact on-disk size of the following data frame.]),
+  ([4], [`Uncompressed_Size`], [`u32`], [Size of the following data frame's decoded output.]),
   ([1], [`Flags`], [`u8`], [Bit 0: `Stored` (advisory; see @data-frame). Bits 1–7 reserved (`0x0`).]),
   ([4], [`Checksum`], [`u32`], [CRC32 over all preceding bytes of this frame; the trailing 4 bytes, located via `Frame_Size`.]),
 )
 
-#todo[Integer width of `Compressed_Size` / `Uncompressed_Size` (u64 here) is @issue-int. Whether the block-header checksum should be mandatory, optional (flag-gated), or dropped in favour of the data frame's own content checksum is @issue-ck.]
+#rule[
+*Block size limit.* A block's `Uncompressed_Size`, and its on-disk length (block-header frame plus data frame, the index's `Block_Length`), #MUST each be less than $2^32$ bytes. The frames between two consecutive blocks #MUST likewise total less than $2^32$ bytes. These bounds let the index store every per-block quantity as a `u32` (@index).
+]
+
+#todo[Whether the block-header checksum should be mandatory, optional (flag-gated), or dropped in favour of the data frame's own content checksum is @issue-ck.]
 
 == Data frame <data-frame>
 
@@ -229,7 +234,7 @@ A zstd frame is `Magic_Number` (4 bytes) followed by a `Frame_Header` (2–14 by
 
 *Streaming (forward-only).* A reader loops: read the block-header frame, learn `Compressed_Size` and `Uncompressed_Size`, read exactly `Compressed_Size` bytes for the data frame, and hand the pair (compressed bytes, expected output size) to a worker. No frame internals are parsed to find boundaries, and the output buffer is pre-sized exactly. This is possible on a pipe, with no seeking and no index.
 
-*Seekable.* A reader loads the index (@index) and binary-searches it to find the block covering a target uncompressed offset, then reads and decodes that block.
+*Seekable.* A reader uses the index (@index) to find the block covering a target uncompressed offset, then reads and decodes that block.
 
 #note[Because the container learns block boundaries from the block-header frames rather than by parsing data frames, it is *codec-agnostic*: the payload codec can change (@profiles) without changing how blocks are found or the file is indexed. This is the mechanism by which bzst is "OpenZL-ready" (@profiles).]
 
@@ -246,40 +251,90 @@ The final bytes of the file form a fixed trailer that lets a reader find the ind
   ([4], [`EOF_Magic`], [`0x8F92EA5B`], [Sentinel; the last four bytes of the file.]),
 )
 
-A reader seeks to `EOF − 12`, reads these twelve bytes, checks `EOF_Magic`, then seeks to `Index_Offset` and parses the index frame. Absence of `EOF_Magic` signals a truncated or non-bzst file. These twelve bytes are the tail of the index frame's payload (they are within its `Frame_Size`), so a generic `zstd` decoder still skips the whole frame.
+A reader seeks to `EOF − 12`, reads these twelve bytes and checks `EOF_Magic`; absence of `EOF_Magic` signals a truncated or non-bzst file. The index's directory and fixed fields sit immediately before the trailer (@index-layout), so in practice a reader reads a larger tail in one go and finds them there. These twelve bytes are the tail of the index frame's payload (they are within its `Frame_Size`), so a generic `zstd` decoder still skips the whole frame.
 
 #note[Provisional `EOF_Magic` `0x8F92EA5B` echoes the `seekable_format` sentinel family (`0x8F92EAB1`) while being distinct; final value is @issue-magic. Using an absolute `Index_Offset` (rather than a distance-from-EOF) is simplest for a single file but interacts with concatenation (@issue-concat).]
 
-== Index frame contents
+== Index frame contents <index-layout>
 
 #layout(
   ([4], [`Magic_Number`], [`0x184D2A5B`], [Structural-frame magic.]),
   ([4], [`Frame_Size`], [`u32`], [Bytes following.]),
   ([1], [`Subtype`], [`0x02`], [Index.]),
-  ([1], [`Index_Flags`], [`u8`], [Bit 0: `Entries` blob is `zstd`-compressed. Bits 1–7 reserved (`0x0`).]),
-  ([8], [`Entry_Count`], [`u64`], [Number of blocks (= number of entries).]),
+  ([varies], [`Partitions`], [`zstd` frames], [`Partition_Count` partitions, in block order and contiguous (@index-partitions).]),
+  ([varies], [`Directory`], [see below], [32 bytes per partition, in partition order (@index-directory).]),
+  ([8], [`Entry_Count`], [`u64`], [Number of blocks (= number of entries across all partitions).]),
   ([8], [`Total_Uncompressed`], [`u64`], [Sum of all blocks' uncompressed sizes; the end sentinel for search.]),
-  ([varies], [`Entries`], [see below], [`Entry_Count` entries; `zstd`-compressed iff `Index_Flags` bit 0.]),
-  ([4], [`Checksum`], [`u32`], [CRC32 over the *uncompressed* `Entries` plus the fixed fields above.]),
+  ([8], [`Blocks_End`], [`u64`], [File offset just past the last block's data frame (the end of the header frame if there are no blocks).]),
+  ([4], [`Partition_Count`], [`u32`], [Number of partitions (= number of directory entries).]),
+  ([4], [`Checksum`], [`u32`], [CRC32 over the bytes from the start of `Directory` to the end of `Partition_Count`.]),
   ([8], [`Index_Offset`], [`u64`], [Trailer (see above).]),
   ([4], [`EOF_Magic`], [`0x8F92EA5B`], [Trailer; last bytes of the file.]),
 )
 
-Each entry, in block order, is 24 bytes:
+Everything a reader needs to plan a lookup sits at the end of the frame: the directory and the fixed fields occupy the last 44 + 32 × `Partition_Count` bytes of the file. A reader that fetches the tail of the file (say its last 64 KiB) obtains the trailer, the counts and the whole directory in one read, then fetches a single partition per lookup. `Blocks_End` and `Index_Offset` together bracket whatever was written after the last block and before the index, so derived formats can find their trailing frames from the same read (@derived-index). `Checksum` covers exactly that contiguous region, so it can be verified without reading any partition; each partition is protected by its own `zstd` content checksum. The leading envelope fields are validated by value instead (@index-validation); there is no index flags or version field, because the header's `Format_Version` already governs how the whole file, index included, is interpreted.
+
+Logically the index holds one entry per block, in block order:
+
+/ `Uncompressed_Offset`: Uncompressed byte offset at which the block's decoded data begins. (Binary-search key.)
+/ `Block_Offset`: Absolute file offset of the block's *block-header frame*.
+/ `Block_Length`: On-disk length of [block-header frame + data frame].
+
+This entry shape is deliberate. A single read of `Block_Length` bytes starting at `Block_Offset` fetches the block-header frame *and* the whole data frame in one I/O — important on high-latency storage systems (e.g. object stores, network filesystems) — and that one buffer already contains the `Uncompressed_Size` needed to pre-size the decode buffer. The entries are not stored in this form; partitions store per-block sizes from which a reader rebuilds them with running sums.
+
+== Partitions <index-partitions>
+
+The entries are divided, in block order, into *partitions* of consecutive entries. Each partition is stored as a single `zstd` frame whose decompressed content is exactly 12 × `Entry_Count` bytes: three columns of `Entry_Count` `u32` values, stored one column after another (every value of the first column, then of the second, then of the third).
 
 #layout(
-  ([8], [`Uncompressed_Offset`], [`u64`], [Uncompressed byte offset at which this block's decoded data begins. (Binary-search key.)]),
-  ([8], [`Block_Offset`], [`u64`], [Absolute file offset of this block's *block-header frame*.]),
-  ([8], [`Block_Length`], [`u64`], [On-disk length of [block-header frame + data frame].]),
+  ([4 × _n_], [`Uncompressed_Size`], [`u32`[_n_]], [Each block's decoded size; non-zero.]),
+  ([4 × _n_], [`Derived_Frames_Length`], [`u32`[_n_]], [Bytes of other frames (derived-format or any other skippable frames) between the end of the previous block and this block's block-header frame. #MUST be `0` for a partition's first entry, whose position the directory gives.]),
+  ([4 × _n_], [`Block_Length`], [`u32`[_n_]], [On-disk length of [block-header frame + data frame].]),
 )
 
-This entry shape is deliberate. A single read of `Block_Length` bytes starting at `Block_Offset` fetches the block-header frame *and* the whole data frame in one I/O — important on high-latency storage systems (e.g. object stores, network filesystems) — and that one buffer already contains the `Uncompressed_Size` needed to pre-size the decode buffer. Uncompressed size per block is not stored: it is `Uncompressed_Offset` of the next entry minus this one (and `Total_Uncompressed` closes the last block).
+A partition's `zstd` frame #MUST set the `Content_Checksum` flag and #MUST record `Frame_Content_Size`, so a reader can check the decompressed size before allocating for it. A reader rebuilds the logical entries from the partition's directory entry with running sums:
 
-*To seek to uncompressed offset $x$:* binary-search `Entries` for the greatest `Uncompressed_Offset` ≤ $x$; read `Block_Length` bytes at `Block_Offset`; decode the data frame; skip $x −$ `Uncompressed_Offset` bytes into the result.
+```
+Uncompressed_Offset[0] = First_Uncompressed_Offset
+Block_Offset[0]        = First_Block_Offset
+Uncompressed_Offset[i] = Uncompressed_Offset[i-1] + Uncompressed_Size[i-1]
+Block_Offset[i]        = Block_Offset[i-1] + Block_Length[i-1]
+                         + Derived_Frames_Length[i]
+```
 
-== Optional index compression
+#note[Sizes rather than offsets, stored column by column, are what make the index compressible: values within a column cluster around the writer's target block size, and when no other frames sit between blocks the `Derived_Frames_Length` column is all zeros. Measured on BAM, VCF and FASTA files at 64 KiB to 1 MiB blocks, partitions of 4,096 entries compress to about 3–6 bytes per block, against 24 bytes per block for fixed-width absolute entries, while each partition stays independently decodable.]
 
-Absolute offsets let a reader binary-search the index directly on the memory-mapped file. Setting `Index_Flags` bit 0 instead stores the `Entries` blob as a `zstd` frame; a reader then decompresses the entire blob into memory once and searches it there (the absolute offsets remain valid). This trades on-disk searchability for a smaller index and is worthwhile for very large files. The fixed fields (`Entry_Count`, `Total_Uncompressed`, flags) are never compressed, so a reader can always read them without decompressing. Index compression is transparent to `zstd -d`, which skips the whole frame regardless.
+== Directory <index-directory>
+
+One 32-byte entry per partition, in partition order:
+
+#layout(
+  ([8], [`First_Uncompressed_Offset`], [`u64`], [`Uncompressed_Offset` of the partition's first block. (Binary-search key.)]),
+  ([8], [`First_Block_Offset`], [`u64`], [`Block_Offset` of the partition's first block.]),
+  ([8], [`Partition_Offset`], [`u64`], [Absolute file offset of the partition's `zstd` frame.]),
+  ([4], [`Partition_Length`], [`u32`], [On-disk length of the partition's `zstd` frame.]),
+  ([4], [`Entry_Count`], [`u32`], [Number of entries (blocks) in the partition; at least 1.]),
+)
+
+*To seek to uncompressed offset $x$:* read the tail of the file, which yields the trailer, the fixed fields and the directory; binary-search the directory for the greatest `First_Uncompressed_Offset` ≤ $x$; read `Partition_Length` bytes at `Partition_Offset` and decompress them; walk the running sums to the greatest `Uncompressed_Offset` ≤ $x$; read `Block_Length` bytes at `Block_Offset`; decode the data frame; skip $x −$ `Uncompressed_Offset` bytes into the result. On high-latency storage that is two small reads before the block itself.
+
+== Validation <index-validation>
+
+A reader #MUST treat the index as corrupt, and #MAY rebuild it by a forward pass over the block-header frames, unless all of the following hold:
+
+- `Magic_Number`, `Subtype` and `EOF_Magic` match; the frame begins at `Index_Offset` and ends at the end of the file; and `Checksum` matches.
+- The partitions are contiguous: the first begins immediately after `Subtype`, each begins where the previous one ends, and the last ends where the directory begins.
+- Every partition has `Entry_Count` ≥ 1, and the partitions' counts sum to the frame's `Entry_Count`. An empty index has `Partition_Count` = 0 and `Total_Uncompressed` = 0.
+- `Blocks_End` ≤ `Index_Offset`, and the last partition's last block ends exactly at `Blocks_End`.
+- Each partition declares, and decompresses with a valid content checksum to, exactly 12 × `Entry_Count` bytes; every `Uncompressed_Size` is non-zero; every `Block_Length` is at least the 22-byte block-header frame; and the first entry's `Derived_Frames_Length` is 0.
+- `Entry_Count` is at most (`Blocks_End` − 24) / 22, the most blocks that fit after the header frame. A reader checks this before decoding any partition, so a crafted, highly compressible partition cannot make the decoded index much larger than the file.
+- The first partition's `First_Uncompressed_Offset` is 0; each partition's `Uncompressed_Size` values sum to the next partition's `First_Uncompressed_Offset` minus its own (`Total_Uncompressed` closes the last partition); and each partition's last block ends at or before the next partition's `First_Block_Offset`.
+
+A reader that loads only some partitions checks the rules that involve what it has read.
+
+== Partition size
+
+How many entries each partition holds is the writer's choice, and partitions in one file may differ (the last is usually shorter). A default of 4,096 entries keeps each decompressed partition at 48 KiB. Compression barely changes between about 256 and 4,096 entries per partition, so the choice is about access rather than size: smaller partitions mean less to fetch per lookup, larger ones a smaller directory. Writers of very large files may enlarge partitions to keep the directory within a single modest tail read; a 64 KiB read holds the directory of over 2,000 partitions.
 
 #todo[Whether to also store a total compressed length / file length for stronger truncation detection is @issue-trunc. An index that exceeds the 4 GiB skippable `Frame_Size` limit (billions of blocks) would need to span multiple frames; deferred (@issue-concat).]
 
@@ -318,18 +373,17 @@ bzst provides the compression container; a derived format provides meaning. The 
 
 == Anchoring a derived index on the bzst index <derived-index>
 
-A derived format that wants its own trailing index (e.g. a genomic coordinate index) can locate it using the bzst index frame as a structural anchor, requiring no bzst support:
+A derived format that wants its own trailing index (e.g. a genomic coordinate index) places its frames after the last block, where the bzst writer then appends the index. A reader finds them from the same read of the file's tail that it uses for the bzst index:
 
-+ Find the bzst index via the EOF trailer (@index): read `Index_Offset`.
-+ Parse the bzst index. Its last entry gives the end of the last data block, `last_block_end = Block_Offset + Block_Length`.
-+ Everything in the gap `[last_block_end, Index_Offset)` is whatever the derived format wrote after the last block and before the bzst index — for example its coordinate index frame(s). Because skippable frames are self-delimiting *forward* (magic + `Frame_Size`), the reader simply reads that gap forward to discover them.
++ Read the tail of the file (@index-layout): the trailer gives `Index_Offset` and the index's fixed fields give `Blocks_End`.
++ Everything in `[Blocks_End, Index_Offset)` is what the derived format wrote after the last block and before the bzst index — for example its coordinate index frame(s). The two offsets are equal when nothing was written there.
 
-No backward seek or derived back-pointer is required; the derived format need only place its frames in that trailing gap. This is a concrete demonstration of the two-layer split: the derived (semantic) index and the bzst (compression) index coexist, each self-contained, with bzst unaware of the former.
+A reader can then go either way. *Forward:* skippable frames are self-delimiting forward (magic + `Frame_Size`), so it reads the region from `Blocks_End`. *Backward:* frames cannot be walked backward, so a derived format that wants to jump straight to a payload #SHOULD end its last frame with a fixed-size footer of its own (e.g. the payload's absolute offset followed by an identifying magic), which a reader fetches from just before `Index_Offset`. bzst writes `Blocks_End` itself and never reads the region, so derived formats need no bzst support. This is a concrete demonstration of the two-layer split: the derived (semantic) index and the bzst (compression) index coexist, each self-contained, with bzst unaware of the former.
 
 = Recommendations (non-normative) <recommendations>
 
-/ Block size: Choose block size for the access pattern. Smaller blocks (down to BGZF's 64 KiB) give finer random-access granularity and, at ≤ 64 KiB *uncompressed*, remain compatible with the 16-bit within-block field of BAI/CSI virtual offsets. Larger blocks (hundreds of KiB to a few MiB) give better ratio and throughput. There is no format-imposed minimum or maximum.
-/ Record alignment: For record-based data (BAM, BCF, FASTQ), align blocks to record boundaries so no record straddles a block. bzst's unbounded block size means even a single very large record (a long read, a wide multi-sample VCF row) can occupy its own block — something BGZF's 64 KiB limit made impossible.
+/ Block size: Choose block size for the access pattern. Smaller blocks (down to BGZF's 64 KiB) give finer random-access granularity and, at ≤ 64 KiB *uncompressed*, remain compatible with the 16-bit within-block field of BAI/CSI virtual offsets. Larger blocks (hundreds of KiB to a few MiB) give better ratio and throughput. There is no format-imposed minimum; the maximum is just under 4 GiB (@block-layout), far beyond any size useful for random access.
+/ Record alignment: For record-based data (BAM, BCF, FASTQ), align blocks to record boundaries so no record straddles a block. bzst's generous block-size limit (just under 4 GiB) means even a single very large record (a long read, a wide multi-sample VCF row) can occupy its own block — something BGZF's 64 KiB limit made impossible.
 / Checksums: Enable Zstandard's content checksum on data frames.
 / Heterogeneous data: For data whose statistics drift along the file (e.g. concatenated FASTQs, name-sorted or multi-sample data), prefer larger blocks, which capture local context per block. A single static dictionary trained on the head of such a file degrades as the data diverges from its training sample (@issue-dict).
 / Small block sizes: If small blocks are required (e.g. for BAI/CSI compatibility), a dictionary was explored as a way to offset the resulting ratio cost, but did not prove worthwhile for v1 (@issue-dict).
@@ -338,9 +392,6 @@ No backward seek or derived back-pointer is required; the derived format need on
 = Open issues <open-issues>
 
 Tracked design questions. Resolved decisions and their rationale are in @resolved.
-
-== Integer width for block sizes <issue-int>
-The block-header frame's `Compressed_Size` / `Uncompressed_Size` are `u64` in this draft. `u32` would halve the per-block header and matches `seekable_format`/`zeekstd` precedent while still allowing 4 GiB blocks; `u64` future-proofs and honours "the type is the only limit on block size." Whole-file *offsets* in the index stay `u64` regardless. *Lean:* `u64`. Open.
 
 == Dictionary profile <issue-dict>
 The dictionary subtype (`0x03`) is reserved but not specified in v1. Initial experiments applying dictionaries to both short-read and long-read data did not show gains sufficient to warrant a dictionary profile in v1. The idea is not ruled out — dictionaries may be revisited in a future version if they prove their worth.
@@ -370,13 +421,14 @@ Whether the per-block block-header checksum should be mandatory (as drafted), fl
 - *One reserved skippable magic, subtyped internally*; the other fifteen are left to derived formats. Unknown subtypes #MUST be skipped. _Why:_ frugal with the scarce 16-value global magic space; fully bzst-controlled subtype space; no bzst-vs-derived collisions inside a file.
 - *`BlockHeader` (subtype `0x01`) rather than "sizing"*, and forward-extensible: fixed leading fields, optional trailing per-block metadata in later versions, trailing checksum located via `Frame_Size`. _Why:_ clearer name; the block header is the natural home for future per-block metadata.
 - *Advisory `Stored` flag* for zstd `Raw` (store-only) data frames; the zstd framing is authoritative and such frames stay baseline-decodable. _Why:_ equal sizes are an unreliable signal, and there is no frame-level stored flag in zstd.
-- *Native index, not reused `seekable_format`.* _Why:_ reuse would force 32-bit sizes, fragile reconstruct-only offsets, and a dummy entry for every interleaved skippable frame; the interop value (one niche contrib tool) is low.
-- *Absolute `u64` offsets in the index* (on-disk binary search); *compressible from day one* (flag-gated), default uncompressed.
-- *The index addresses the block-header frame and stores [uncompressed_offset, block_offset, block_length].* _Why:_ one read fetches block header + data together and carries the uncompressed size needed to pre-size the buffer, with no size duplicated except the block length.
+- *Native index, not reused `seekable_format`.* _Why:_ reuse would force offsets reconstructible only by summing from the start of the file, and a dummy entry for every interleaved skippable frame; the interop value (one niche contrib tool) is low.
+- *A partitioned, `zstd`-compressed index with a fixed-width directory at the end*, and no other index encoding. Partitions store per-block sizes as `u32` columns; the directory anchors each partition with absolute `u64` offsets. _Why:_ a lookup reads the file's tail and one small partition (two reads on high-latency storage) without loading the whole index; on the genomic data measured the index is about 4–7× smaller than fixed 24-byte entries; and implementers need nothing beyond the `zstd` they already have, little-endian integers and running sums — no variable-length integer codec.
+- *The index addresses the block-header frame*; each logical entry is [uncompressed_offset, block_offset, block_length]. _Why:_ one read fetches block header + data together and carries the uncompressed size needed to pre-size the buffer, with no size duplicated except the block length.
 - *Inline block-header frames are the source of truth*; the index is a reconstructible accelerator. A missing/damaged index never breaks the file.
-- *Derived indices anchor on the bzst index* (@derived-index) by forward-reading the trailing gap; no bzst support required.
+- *The index records `Blocks_End`*, which with `Index_Offset` brackets the region after the last block where derived formats put their own trailing frames (@derived-index). _Why:_ one tail read then locates both the bzst index and any derived index, and the writer knows the value itself; no derived-format value passes through bzst.
 - *Little-endian throughout; CRC32 for structural checksums*; recommend `zstd` content checksums on data frames. _Why:_ CRC32 ships with zlib and with the standard libraries of many languages, whereas libzstd does not expose its XXH64 through its public API, so XXH64 would force a separate xxHash dependency on most implementations; speed is irrelevant at our scale.
-- *Block size is the writer's choice*, bounded only by the size field's type; no min/max imposed.
+- *`u32` block sizes.* Block-header sizes, and every per-block quantity in the index, are `u32`, so a block is limited to just under 4 GiB uncompressed and on disk. _Why:_ a 4 GiB block is useless for random access, `u32` matches `seekable_format`/`zeekstd` precedent, and it halves the size fields in every block header. Whole-file offsets stay `u64`.
+- *Block size is the writer's choice* within that limit; no minimum is imposed.
 - *No record straddles a block* — a recommendation at the bzst level, a #SHOULDNOT for record-based derived formats (softened from #MUSTNOT: unforeseen use cases may need otherwise).
 
 = OpenZL: findings and forward-compatibility <openzl-note>

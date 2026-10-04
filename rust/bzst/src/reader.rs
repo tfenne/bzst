@@ -66,7 +66,7 @@ impl<R: Read> BzstReader<R> {
                     Some(Frame::Block { header, data }) => {
                         return Ok(Some(decode_block(dec, &header, data)?));
                     }
-                    Some(Frame::Index(_)) => *saw_index = true,
+                    Some(Frame::Index { .. }) => *saw_index = true,
                     Some(_) => {} // header/skippable: not payload, skip
                 }
             },
@@ -79,7 +79,7 @@ impl<R: Read> BzstReader<R> {
                         }
                         // The index frame marks a complete stream and is the last
                         // frame; stop reading once it (or a clean EOF) is reached.
-                        Some(Frame::Index(_)) => {
+                        Some(Frame::Index { .. }) => {
                             *saw_index = true;
                             *reading_done = true;
                         }
@@ -258,7 +258,11 @@ impl<R: Read + Seek> SeekableReader<R> {
         let mut block = vec![0u8; entry.block_length as usize];
         self.inner.read_exact(&mut block)?;
         let bh = BlockHeader::parse_frame(&block)?;
-        check_block_fits(bh.compressed_size, bh.uncompressed_size, self.max_block_bytes)?;
+        check_block_fits(
+            u64::from(bh.compressed_size),
+            u64::from(bh.uncompressed_size),
+            self.max_block_bytes,
+        )?;
         let data = &block[BLOCK_HEADER_FRAME_LEN..];
         self.cache.clear();
         self.cache.resize(bh.uncompressed_size as usize, 0);

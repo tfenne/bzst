@@ -23,8 +23,8 @@ use crate::frame::{EncodedBlock, FrameWriter, Header};
 use crate::index::IndexBuilder;
 use crate::threads::{max_blocks_for_threads, Pool, Threads};
 use crate::{
-    BzstError, BzstResult, Profiles, DEFAULT_BLOCK_SIZE, DEFAULT_LEVEL, SKIPPABLE_MAGIC_MAX,
-    SKIPPABLE_MAGIC_MIN, STRUCTURAL_MAGIC,
+    BzstError, BzstResult, Profiles, DEFAULT_BLOCK_SIZE, DEFAULT_INDEX_PARTITION_ENTRIES,
+    DEFAULT_LEVEL, MAX_BLOCK_SIZE, SKIPPABLE_MAGIC_MAX, SKIPPABLE_MAGIC_MIN, STRUCTURAL_MAGIC,
 };
 
 /// Writes a bzst stream to an underlying `Write`. Implements [`std::io::Write`]
@@ -38,6 +38,7 @@ pub struct BzstWriter<W: Write> {
     index: IndexBuilder,
     staging: Vec<u8>,
     block_size: usize,
+    index_partition_entries: usize,
     strategy: Strategy,
 }
 
@@ -86,7 +87,7 @@ impl<W: Write> BzstWriter<W> {
         self.end_block()?;
         self.drain_inflight()?;
         let index = std::mem::replace(&mut self.index, IndexBuilder::new()).finish();
-        self.fw.write_index(&index)?;
+        self.fw.write_index(&index, self.index_partition_entries)?;
         self.fw.flush()?;
         Ok(self.fw.into_inner())
     }
@@ -135,7 +136,7 @@ impl<W: Write> BzstWriter<W> {
         encoded: &EncodedBlock,
     ) -> BzstResult<()> {
         let offset = fw.write_encoded_block(encoded)?;
-        index.push(offset, encoded.on_disk_len(), encoded.header.uncompressed_size);
+        index.push(offset, encoded.on_disk_len(), u64::from(encoded.header.uncompressed_size));
         Ok(())
     }
 }
@@ -175,6 +176,7 @@ pub struct BzstWriterBuilder<W> {
     content_checksum: bool,
     format_signature: [u8; 4],
     threads: Threads,
+    index_partition_entries: usize,
 }
 
 impl<W: Write> BzstWriterBuilder<W> {
@@ -186,6 +188,7 @@ impl<W: Write> BzstWriterBuilder<W> {
             content_checksum: true,
             format_signature: [0; 4],
             threads: Threads::Serial,
+            index_partition_entries: DEFAULT_INDEX_PARTITION_ENTRIES,
         }
     }
 
@@ -195,7 +198,8 @@ impl<W: Write> BzstWriterBuilder<W> {
         self
     }
 
-    /// Target uncompressed block size (default [`crate::DEFAULT_BLOCK_SIZE`]).
+    /// Target uncompressed block size (default [`crate::DEFAULT_BLOCK_SIZE`]); at
+    /// most [`crate::MAX_BLOCK_SIZE`].
     pub fn block_size(mut self, bytes: usize) -> Self {
         self.block_size = bytes.max(1);
         self
@@ -219,6 +223,14 @@ impl<W: Write> BzstWriterBuilder<W> {
         self
     }
 
+    /// Blocks described by each compressed index partition (default
+    /// [`crate::DEFAULT_INDEX_PARTITION_ENTRIES`]). Smaller partitions mean less
+    /// to read per random-access lookup; larger ones a smaller partition directory.
+    pub fn index_partition_entries(mut self, entries: usize) -> Self {
+        self.index_partition_entries = entries.clamp(1, u32::MAX as usize);
+        self
+    }
+
     /// Builds the writer, validating the level and writing the header frame.
     pub fn build(self) -> BzstResult<BzstWriter<W>> {
         let BzstWriterBuilder {
@@ -228,12 +240,16 @@ impl<W: Write> BzstWriterBuilder<W> {
             content_checksum,
             format_signature,
             threads,
+            index_partition_entries,
         } = self;
         if !zstd::compression_level_range().contains(&level) {
             return Err(BzstError::Io(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!("zstd level {level} out of range"),
             )));
+        }
+        if block_size > MAX_BLOCK_SIZE {
+            return Err(BzstError::ExceedsFormatLimit("the configured block size"));
         }
         let strategy = match threads {
             Threads::Serial => Strategy::Serial(ZstdCompressor::new(level, content_checksum)?),
@@ -246,7 +262,14 @@ impl<W: Write> BzstWriterBuilder<W> {
         };
         let mut fw = FrameWriter::new(inner);
         fw.write_header(&Header::new(format_signature, Profiles::BASELINE))?;
-        Ok(BzstWriter { fw, index: IndexBuilder::new(), staging: Vec::new(), block_size, strategy })
+        Ok(BzstWriter {
+            fw,
+            index: IndexBuilder::new(),
+            staging: Vec::new(),
+            block_size,
+            index_partition_entries,
+            strategy,
+        })
     }
 }
 

@@ -13,7 +13,7 @@ Status: **early but working.** The core format (baseline profile) round-trips, i
 
 ```sh
 cargo build --release
-cargo test                     # 76 tests
+cargo test                     # 114 tests
 cargo ci-fmt && cargo ci-clippy && cargo ci-test   # the CI gate set
 
 # CLI — gzip/bgzip-style: compresses in place by default, removing the input.
@@ -53,18 +53,24 @@ let mut sr = SeekableReader::new(std::io::Cursor::new(&bytes))?;
 let mut buf = vec![0u8; 4096];
 sr.read_range(1_000_000, &mut buf)?;
 
+// Index lookups that read only the file's tail and one index partition.
+let mut lazy = bzst::LazyIndex::open(std::io::Cursor::new(&bytes))?;
+let entry = lazy.entry_for_offset(1_000_000)?;
+
 // One-shot helpers.
 let c = bzst::compress(payload, 3)?;
 let d = bzst::decompress(&c)?;
 ```
 
-The zstd codec and raw frame I/O are internal (`pub(crate)`); the public surface is the high-level reader/writer, the value types (`Header`, `BlockHeader`, `Index`, `IndexEntry`, `OwnedFrame`), the `Frames` iterator (for derived formats reading their skippable metadata), and the free functions (`compress`, `decompress`, `concat`, `detect`, `header_of`).
+The zstd codec and raw frame I/O are internal (`pub(crate)`); the public surface is the high-level reader/writer, the value types (`Header`, `BlockHeader`, `Index`, `IndexEntry`, `OwnedFrame`), `LazyIndex` for on-demand index lookups, the `Frames` iterator (for derived formats reading their skippable metadata), and the free functions (`compress`, `decompress`, `concat`, `detect`, `header_of`).
 
 ## What's implemented
 
 - Baseline profile: header / block-header / data / index frames, per the spec's provisional layout and magic numbers.
 - Serial + pipelined-parallel writer and reader (own-threads or a shared `Pool`): blocks (de)compress on worker threads while the calling thread does ordered I/O, so compute overlaps I/O and the parallel output is byte-identical to serial.
-- Seekable random access with absolute-offset index; `Index::read_from` (EOF trailer) and `Index::rebuild` (forward pass) agree.
+- Partitioned, zstd-compressed index: per-block `u32` columns in partitions of 4,096 blocks by default (`index_partition_entries` / `--index-partition-entries`), with a fixed-width directory at the end of the file. `Index::read_from` decodes it all; `LazyIndex` reads only the file's tail and one partition per lookup. The index tail also records `Blocks_End`, so `blocks_end()` and `index_offset()` bracket any frames a derived format wrote after its last block. `Index::read_from` and `Index::rebuild` (forward pass) agree.
+- Block sizes are `u32`, so a block is limited to just under 4 GiB; the writer reports anything larger as `ExceedsFormatLimit`.
+- Seekable random access (`SeekableReader`) over the uncompressed stream.
 - Structural-frame CRC32 checksums (zlib's `crc32()`); data-frame zstd content checksums (on by default).
 - Robust decode: truncation is detected (a stream missing its trailing index errors instead of silently returning partial output), corrupt or oversized block sizes are rejected with a clean `BlockTooLarge` error rather than an OOM abort (capped at ~95% of host RAM), and a corrupt-but-present index is transparently rebuilt from the block-header frames.
 - Derived-format skippable-frame injection (`write_skippable_frame`) and reading (`Frames`).
@@ -73,9 +79,8 @@ The zstd codec and raw frame I/O are internal (`pub(crate)`); the public surface
 
 ## Open questions & TODOs
 
-- **Provisional wire constants** (structural magic `0x184D2A5B`, EOF magic `0x8F92EA5B`) — see spec open issue §10.3.
-- **Index compression** (`Index_Flags` bit 0) is not decoded in v1; a compressed index is treated as an unrecoverable index, so seekable readers rebuild from the block-header frames instead.
-- **Dictionary profile** is out of v1 (spec §10.2); the codec seam and `Profiles` bit are reserved for it.
+- **Provisional wire constants** (structural magic `0x184D2A5B`, EOF magic `0x8F92EA5B`) — see the spec's open issue on magic-number selection.
+- `SeekableReader` loads the whole index on open; it could use `LazyIndex` instead to suit high-latency storage.
+- **Dictionary profile** is out of v1 (see the spec's open issue on it); the codec seam and `Profiles` bit are reserved for it.
 - No standalone `bzst::verify` library function yet; the CLI's `-t` composes a streaming decode (validating structural + content checksums) with an index-vs-rebuild check.
 - The `Stored` block flag is never set by the writer (advisory; zstd framing is authoritative).
-- `u32` vs `u64` block-size fields (spec §10.1) — currently `u64`.

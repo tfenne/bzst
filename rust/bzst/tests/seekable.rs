@@ -4,12 +4,36 @@ mod common;
 
 use std::io::{Read, Seek, SeekFrom, Write};
 
-use bzst::{BzstWriter, Index, SeekableReader};
+use bzst::{BzstWriter, Index, LazyIndex, SeekableReader};
 use common::{pseudo_text, random_bytes};
 
 fn write_file(data: &[u8], block_size: usize) -> Vec<u8> {
     let mut w = BzstWriter::builder(Vec::new()).block_size(block_size).build().unwrap();
     w.write_all(data).unwrap();
+    w.finish().unwrap()
+}
+
+/// Writes `data` in `block_size` blocks with `partition_entries` blocks per index
+/// partition, putting a derived-format frame of varying length after every
+/// `derived_every`th block so the index must account for frames between blocks.
+fn write_with_derived_frames(
+    data: &[u8],
+    block_size: usize,
+    partition_entries: usize,
+    derived_every: usize,
+) -> Vec<u8> {
+    let mut w = BzstWriter::builder(Vec::new())
+        .block_size(block_size)
+        .index_partition_entries(partition_entries)
+        .build()
+        .unwrap();
+    for (i, chunk) in data.chunks(block_size).enumerate() {
+        w.write_all(chunk).unwrap();
+        w.end_block().unwrap();
+        if i % derived_every == 0 {
+            w.write_skippable_frame(0x184D_2A50, format!("metadata for block {i}")).unwrap();
+        }
+    }
     w.finish().unwrap()
 }
 
@@ -138,4 +162,90 @@ fn uncompressed_block_size_partitions_the_stream() {
     assert!(*sizes.last().unwrap() <= 64 << 10);
     // An out-of-range block index yields None.
     assert_eq!(index.uncompressed_block_size(n), None);
+}
+
+#[test]
+fn index_accounts_for_derived_frames_between_blocks() {
+    let data = pseudo_text(200_000, 31);
+    let bytes = write_with_derived_frames(&data, 1000, 16, 3);
+    let read = Index::read_from(&mut std::io::Cursor::new(&bytes)).unwrap();
+    let rebuilt = Index::rebuild(std::io::Cursor::new(&bytes)).unwrap();
+    assert_eq!(read.len(), 200);
+    assert_eq!(read, rebuilt);
+}
+
+#[test]
+fn index_partition_size_does_not_change_the_index() {
+    let data = pseudo_text(200_000, 32);
+    let indices: Vec<Index> = [1, 16, 4096]
+        .into_iter()
+        .map(|partition_entries| {
+            let bytes = write_with_derived_frames(&data, 1000, partition_entries, 5);
+            Index::read_from(&mut std::io::Cursor::new(&bytes)).unwrap()
+        })
+        .collect();
+    assert_eq!(indices[0], indices[1]);
+    assert_eq!(indices[1], indices[2]);
+}
+
+#[test]
+fn lazy_index_agrees_with_the_full_index() {
+    let data = pseudo_text(200_000, 33);
+    let bytes = write_with_derived_frames(&data, 1000, 16, 3);
+    let index = Index::read_from(&mut std::io::Cursor::new(&bytes)).unwrap();
+    let mut lazy = LazyIndex::open(std::io::Cursor::new(&bytes)).unwrap();
+    assert_eq!(lazy.partition_count(), 13); // 200 blocks, 16 per partition
+    assert_eq!(lazy.len(), 200);
+    assert_eq!(lazy.total_uncompressed(), data.len() as u64);
+    for offset in (0..data.len() as u64).step_by(331) {
+        let expected = index.block_for_offset(offset).map(|i| *index.entry(i).unwrap());
+        assert_eq!(lazy.entry_for_offset(offset).unwrap(), expected, "offset {offset}");
+    }
+    assert_eq!(lazy.entry_for_offset(data.len() as u64).unwrap(), None);
+}
+
+#[test]
+fn read_range_across_derived_frames() {
+    let data = pseudo_text(200_000, 34);
+    let bytes = write_with_derived_frames(&data, 1000, 16, 2);
+    let mut sr = SeekableReader::new(std::io::Cursor::new(&bytes)).unwrap();
+    let mut buf = vec![0u8; 5000];
+    assert_eq!(sr.read_range(123_456, &mut buf).unwrap(), buf.len());
+    assert_eq!(buf, data[123_456..128_456]);
+}
+
+#[test]
+fn trailing_derived_frames_lie_between_blocks_end_and_the_index() {
+    const DERIVED_MAGIC: u32 = 0x184D_2A50;
+    let data = pseudo_text(100_000, 35);
+    let mut w = BzstWriter::builder(Vec::new()).block_size(10_000).build().unwrap();
+    w.write_all(&data).unwrap();
+    // A derived index after the last block, ending in a fixed-size footer (here,
+    // its own length) so a reader can also find it by reading backward.
+    let derived_index = b"a derived coordinate index".to_vec();
+    let mut payload = derived_index.clone();
+    payload.extend_from_slice(&(derived_index.len() as u64).to_le_bytes());
+    w.write_skippable_frame(DERIVED_MAGIC, &payload).unwrap();
+    let bytes = w.finish().unwrap();
+
+    let lazy = LazyIndex::open(std::io::Cursor::new(&bytes)).unwrap();
+    let (start, end) = (lazy.blocks_end() as usize, lazy.index_offset() as usize);
+    assert_eq!(end - start, 8 + payload.len(), "only the derived frame lies between them");
+
+    // Forward: the derived frame starts exactly at blocks_end.
+    assert_eq!(u32::from_le_bytes(bytes[start..start + 4].try_into().unwrap()), DERIVED_MAGIC);
+    assert_eq!(&bytes[start + 8..end - 8], derived_index);
+
+    // Backward: the footer just before the index locates the payload.
+    let len = u64::from_le_bytes(bytes[end - 8..end].try_into().unwrap()) as usize;
+    assert_eq!(&bytes[end - 8 - len..end - 8], derived_index);
+}
+
+#[test]
+fn blocks_end_equals_index_offset_without_trailing_frames() {
+    let bytes = write_file(&pseudo_text(100_000, 36), 10_000);
+    let lazy = LazyIndex::open(std::io::Cursor::new(&bytes)).unwrap();
+    assert_eq!(lazy.blocks_end(), lazy.index_offset());
+    let index = Index::read_from(&mut std::io::Cursor::new(&bytes)).unwrap();
+    assert_eq!(index.blocks_end(), lazy.blocks_end());
 }
